@@ -1,4 +1,3 @@
-// internal/ledger/validator.go
 package ledger
 
 import (

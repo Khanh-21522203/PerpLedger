@@ -1,4 +1,3 @@
-// internal/core/sequence_validator.go (NEW)
 package core
 
 import (

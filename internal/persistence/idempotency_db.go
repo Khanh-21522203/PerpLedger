@@ -1,4 +1,3 @@
-// internal/persistence/idempotency_db.go (NEW)
 package persistence
 
 import (

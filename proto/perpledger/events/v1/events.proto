@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package perpledger.events.v1;
+
+option go_package = "PerpLedger/gen/go/perpledger/events/v1;eventsv1";
+
+// EventEnvelope wraps all inbound events with common metadata.
+message EventEnvelope {
+  string idempotency_key = 1;
+  EventType event_type = 2;
+  string market_id = 3;          // empty for global events
+  int64 source_sequence = 4;
+  int64 timestamp_us = 5;        // epoch microseconds
+  bytes payload = 6;             // type-specific payload
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  TRADE_FILL = 1;
+  DEPOSIT_INITIATED = 2;
+  DEPOSIT_CONFIRMED = 3;
+  WITHDRAWAL_REQUESTED = 4;
+  WITHDRAWAL_CONFIRMED = 5;
+  WITHDRAWAL_REJECTED = 6;
+  MARK_PRICE_UPDATE = 7;
+  FUNDING_RATE_SNAPSHOT = 8;
+  FUNDING_EPOCH_SETTLE = 9;
+  RISK_PARAM_UPDATE = 10;
+  LIQUIDATION_TRIGGERED = 11;
+  LIQUIDATION_FILL = 12;
+  LIQUIDATION_COMPLETED = 13;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  LONG = 1;
+  SHORT = 2;
+}
+
+// --- Event Payloads ---
+
+message TradeFill {
+  string fill_id = 1;           // UUID, idempotency key
+  string order_id = 2;
+  string user_id = 3;           // UUID
+  string market_id = 4;
+  Side side = 5;
+  int64 quantity = 6;           // fixed-point
+  int64 price = 7;              // fixed-point
+  int64 fee = 8;                // fixed-point
+  int64 timestamp_us = 9;
+  int64 source_sequence = 10;
+}
+
+message DepositEvent {
+  string deposit_id = 1;        // UUID, idempotency key
+  string user_id = 2;           // UUID
+  string asset = 3;             // e.g., "USDT"
+  int64 amount = 4;             // fixed-point, must be > 0
+  int64 timestamp_us = 5;
+  int64 source_sequence = 6;
+}
+
+message WithdrawalEvent {
+  string withdrawal_id = 1;     // UUID, idempotency key
+  string user_id = 2;
+  string asset = 3;
+  int64 amount = 4;             // fixed-point, must be > 0
+  int64 timestamp_us = 5;
+  int64 source_sequence = 6;
+  string reason = 7;            // only for rejected; empty otherwise
+}
+
+message MarkPriceUpdate {
+  string market_id = 1;
+  int64 mark_price = 2;         // fixed-point, must be > 0
+  int64 price_sequence = 3;     // monotonic per market
+  int64 price_timestamp_us = 4;
+  int64 index_price = 5;        // optional, for reference
+}
+
+message FundingRateSnapshot {
+  string market_id = 1;
+  int64 funding_rate = 2;       // fixed-point (scale=100_000_000), signed
+  int64 epoch_id = 3;           // monotonic per market
+  int64 mark_price = 4;
+  int64 epoch_timestamp_us = 5;
+}
+
+message FundingEpochSettle {
+  string market_id = 1;
+  int64 epoch_id = 2;
+}
+
+message RiskParamUpdate {
+  string market_id = 1;
+  int64 im_fraction = 2;        // fixed-point (scale=1_000_000)
+  int64 mm_fraction = 3;        // fixed-point (scale=1_000_000)
+  int64 max_leverage = 4;       // fixed-point (scale=1_000_000)
+  map<string, int64> haircuts = 5;
+  int64 effective_sequence = 6;
+  int64 timestamp_us = 7;
+}
+
+message LiquidationFill {
+  string liquidation_id = 1;
+  string fill_id = 2;           // UUID
+  string user_id = 3;
+  string market_id = 4;
+  Side side = 5;                // closing side
+  int64 quantity = 6;           // fixed-point
+  int64 price = 7;              // fixed-point
+  int64 timestamp_us = 8;
+  int64 source_sequence = 9;
+}
+
+message LiquidationCompleted {
+  string liquidation_id = 1;
+  string user_id = 2;
+  string market_id = 3;
+  int64 deficit = 4;            // 0 if no bankruptcy
+  int64 timestamp_us = 5;
+  int64 source_sequence = 6;
+}

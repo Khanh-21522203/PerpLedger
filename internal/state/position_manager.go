@@ -1,4 +1,3 @@
-// internal/state/position_manager.go (UPDATE)
 package state
 
 import (

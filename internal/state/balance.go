@@ -1,4 +1,3 @@
-// internal/state/balance.go
 package state
 
 import "github.com/google/uuid"

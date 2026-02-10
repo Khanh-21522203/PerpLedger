@@ -1,4 +1,3 @@
-// internal/ledger/balance_tracker.go (UPDATE)
 package ledger
 
 import (
@@ -136,6 +135,15 @@ func (bt *BalanceTracker) ComputeGlobalBalance() map[AssetID]int64 {
 	}
 
 	return totals
+}
+
+// ValidateNonNegative checks that a specific account balance is >= 0
+func (bt *BalanceTracker) ValidateNonNegative(key AccountKey) error {
+	balance := bt.GetBalance(key)
+	if balance < 0 {
+		return fmt.Errorf("account %s has negative balance: %d", key.AccountPath(), balance)
+	}
+	return nil
 }
 
 // Snapshot returns a copy of all balances (for state hashing)

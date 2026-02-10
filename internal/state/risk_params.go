@@ -1,4 +1,3 @@
-// internal/state/risk_params.go (NEW)
 package state
 
 // RiskParams defines margin requirements per market

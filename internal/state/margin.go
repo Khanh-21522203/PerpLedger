@@ -1,16 +1,19 @@
-// internal/state/margin.go (CONSOLIDATED - merge cả 2 versions)
 package state
 
 import (
+	"PerpLedger/internal/ledger"
+
 	"github.com/google/uuid"
 )
 
-// MarginCalculator computes cross-margin metrics
+// MarginCalculator computes cross-margin metrics.
+// It uses an interface for balanceTracker to avoid a direct import cycle
+// while still accepting *ledger.BalanceTracker.
 type MarginCalculator struct {
 	positionMgr    *PositionManager
 	balanceTracker interface {
-		GetUserAvailableBalance(uuid.UUID, uint16) int64
-		GetUserReservedBalance(uuid.UUID, uint16) int64
+		GetUserAvailableBalance(uuid.UUID, ledger.AssetID) int64
+		GetUserReservedBalance(uuid.UUID, ledger.AssetID) int64
 	}
 	riskParamsMgr *RiskParamsManager
 }
@@ -18,8 +21,8 @@ type MarginCalculator struct {
 func NewMarginCalculator(
 	pm *PositionManager,
 	bt interface {
-		GetUserAvailableBalance(uuid.UUID, uint16) int64
-		GetUserReservedBalance(uuid.UUID, uint16) int64
+		GetUserAvailableBalance(uuid.UUID, ledger.AssetID) int64
+		GetUserReservedBalance(uuid.UUID, ledger.AssetID) int64
 	},
 	rpm *RiskParamsManager,
 ) *MarginCalculator {
@@ -33,7 +36,7 @@ func NewMarginCalculator(
 // ComputeEffectiveCollateral returns available + total unrealized PnL (with haircuts)
 func (mc *MarginCalculator) ComputeEffectiveCollateral(
 	userID uuid.UUID,
-	quoteAssetID uint16,
+	quoteAssetID ledger.AssetID,
 ) int64 {
 	var effectiveCollateral int64
 
@@ -129,7 +132,7 @@ func (mc *MarginCalculator) ComputeTotalIM(userID uuid.UUID) int64 {
 // ComputeMarginFraction returns effective_collateral / total_notional
 func (mc *MarginCalculator) ComputeMarginFraction(
 	userID uuid.UUID,
-	quoteAssetID uint16,
+	quoteAssetID ledger.AssetID,
 ) int64 {
 	effectiveCollateral := mc.ComputeEffectiveCollateral(userID, quoteAssetID)
 	totalNotional := mc.ComputeTotalNotional(userID)
@@ -148,7 +151,7 @@ func (mc *MarginCalculator) ComputeMarginFraction(
 // CheckMarginHealth returns margin status for user
 func (mc *MarginCalculator) CheckMarginHealth(
 	userID uuid.UUID,
-	quoteAssetID uint16,
+	quoteAssetID ledger.AssetID,
 ) MarginStatus {
 	marginFraction := mc.ComputeMarginFraction(userID, quoteAssetID)
 

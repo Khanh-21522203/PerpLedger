@@ -1,4 +1,3 @@
-// internal/math/funding.go (NEW)
 package math
 
 import (

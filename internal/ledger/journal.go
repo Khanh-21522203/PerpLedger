@@ -1,4 +1,3 @@
-// internal/ledger/journal.go
 package ledger
 
 import (

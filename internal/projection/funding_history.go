@@ -1,4 +1,3 @@
-// internal/projection/funding_history.go (NEW)
 package projection
 
 import (

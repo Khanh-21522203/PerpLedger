@@ -1,4 +1,3 @@
-// internal/math/fixedpoint.go (NEW)
 package math
 
 import (
@@ -20,7 +19,9 @@ var (
 	RateConfig     = DecimalConfig{DecimalPrecision: 8, Scale: 100_000_000} // 0.00000001 (funding rate)
 )
 
-// Int128 is a pooled big.Int for intermediate calculations
+// TRICKY: All monetary multiplications use big.Int to prevent int64 overflow.
+// For example, price(100) * quantity(1_000_000) * rate(100_000_000) can exceed 2^63.
+// We pool big.Int instances to reduce GC pressure in the hot path (per doc §12).
 var int128Pool = &sync.Pool{
 	New: func() interface{} {
 		return new(big.Int)
@@ -55,15 +56,16 @@ func DivideInt128(numerator *big.Int, denominator int64, roundingMode RoundingMo
 	result := quotient.Int64()
 
 	if roundingMode == RoundHalfEven {
-		// Banker's rounding: if remainder == denominator/2, round to even
+		// TRICKY: Banker's rounding (round-half-to-even) ensures deterministic
+		// results with no systematic bias. This is critical for funding settlement
+		// where rounding residuals must be accounted for (posted to fees account).
 		half := big.NewInt(denominator / 2)
 		cmp := remainder.Cmp(half)
 
 		if cmp > 0 {
-			// remainder > half: round up
 			result++
 		} else if cmp == 0 && denominator%2 == 0 {
-			// remainder == half and even denominator: round to even
+			// Exact half: round to nearest even to avoid bias
 			if result%2 != 0 {
 				result++
 			}
@@ -109,7 +111,9 @@ func ComputeAvgEntryPrice(oldSize, oldAvgEntry, fillQty, fillPrice int64) int64 
 	return result
 }
 
-// ComputeRealizedPnL calculates PnL for position close
+// ComputeRealizedPnL calculates PnL for position close.
+// Formula: sideSign * (fillPrice - avgEntryPrice) * closeQty * quoteScale / (priceScale * qtyScale)
+// The scale conversion normalizes from (price_scale × qty_scale) to quote_scale.
 func ComputeRealizedPnL(
 	sideSign int64, // +1 for long, -1 for short
 	fillPrice int64, // Price scale

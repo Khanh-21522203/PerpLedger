@@ -1,4 +1,3 @@
-// internal/ledger/account.go
 package ledger
 
 import (

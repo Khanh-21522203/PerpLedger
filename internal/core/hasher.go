@@ -1,4 +1,3 @@
-// internal/core/hasher.go
 package core
 
 import (

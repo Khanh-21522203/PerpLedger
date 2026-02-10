@@ -1,4 +1,3 @@
-// internal/query/balance.go (NEW)
 package query
 
 import (

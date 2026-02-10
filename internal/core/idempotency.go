@@ -1,4 +1,3 @@
-// internal/core/idempotency.go (COMPLETE IMPLEMENTATION)
 package core
 
 import (
@@ -141,6 +140,27 @@ func (lru *IdempotencyLRU) evictOldest() {
 		entry := elem.Value.(*lruEntry)
 		delete(lru.cache, entry.key)
 		lru.evictions++
+	}
+}
+
+// WarmFromKeys loads a batch of composite keys into the LRU.
+// Per doc §10: on restart, load recent idempotency keys from Postgres
+// into the LRU to avoid cold-path DB lookups for recently processed events.
+func (lru *IdempotencyLRU) WarmFromKeys(keys []string) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	for _, key := range keys {
+		if _, exists := lru.cache[key]; exists {
+			continue
+		}
+		entry := &lruEntry{key: key}
+		elem := lru.lruList.PushFront(entry)
+		lru.cache[key] = elem
+
+		if lru.lruList.Len() > lru.capacity {
+			lru.evictOldest()
+		}
 	}
 }
 

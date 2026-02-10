@@ -1,7 +1,7 @@
-// internal/ledger/generator.go (UPDATE - add validation)
 package ledger
 
 import (
+	"PerpLedger/internal/event"
 	fpmath "PerpLedger/internal/math"
 	"fmt"
 
@@ -21,8 +21,79 @@ func NewJournalGenerator(startSequence int64, tracker *BalanceTracker) *JournalG
 	}
 }
 
-// GenerateWithdrawalRequested creates journals for withdrawal request
-// Pre-check: user must have sufficient available balance (BS-01, BS-07)
+// GenerateDepositInitiated creates journals for a pending deposit.
+// Moves funds: external:deposits → user:pending_deposit
+func (jg *JournalGenerator) GenerateDepositInitiated(
+	evt *event.DepositInitiated,
+	assetID AssetID,
+) (*Batch, error) {
+	batchID := uuid.New()
+
+	batch := &Batch{
+		BatchID:   batchID,
+		EventRef:  evt.DepositID.String(),
+		Sequence:  jg.sequence,
+		Timestamp: evt.Timestamp.UnixMicro(),
+		Journals:  make([]Journal, 0, 1),
+	}
+
+	journal := Journal{
+		JournalID:     uuid.New(),
+		BatchID:       batchID,
+		EventRef:      evt.DepositID.String(),
+		Sequence:      jg.sequence,
+		DebitAccount:  NewUserAccountKey(evt.UserID, SubTypePendingDeposit, assetID),
+		CreditAccount: NewExternalAccountKey(SubTypeExternalDeposits, assetID),
+		AssetID:       assetID,
+		Amount:        evt.Amount,
+		JournalType:   JournalTypeDepositPending,
+		Timestamp:     evt.Timestamp.UnixMicro(),
+	}
+
+	batch.Journals = append(batch.Journals, journal)
+	jg.sequence++
+
+	return batch, nil
+}
+
+// GenerateDepositConfirmed creates journals for a confirmed deposit.
+// Moves funds: external:deposits → user:collateral
+// (If a pending deposit exists, it should be cleared separately.)
+func (jg *JournalGenerator) GenerateDepositConfirmed(
+	evt *event.DepositConfirmed,
+	assetID AssetID,
+) (*Batch, error) {
+	batchID := uuid.New()
+
+	batch := &Batch{
+		BatchID:   batchID,
+		EventRef:  evt.DepositID.String(),
+		Sequence:  jg.sequence,
+		Timestamp: evt.Timestamp.UnixMicro(),
+		Journals:  make([]Journal, 0, 1),
+	}
+
+	journal := Journal{
+		JournalID:     uuid.New(),
+		BatchID:       batchID,
+		EventRef:      evt.DepositID.String(),
+		Sequence:      jg.sequence,
+		DebitAccount:  NewUserAccountKey(evt.UserID, SubTypeCollateral, assetID),
+		CreditAccount: NewExternalAccountKey(SubTypeExternalDeposits, assetID),
+		AssetID:       assetID,
+		Amount:        evt.Amount,
+		JournalType:   JournalTypeDepositConfirm,
+		Timestamp:     evt.Timestamp.UnixMicro(),
+	}
+
+	batch.Journals = append(batch.Journals, journal)
+	jg.sequence++
+
+	return batch, nil
+}
+
+// GenerateWithdrawalRequested creates journals for withdrawal request.
+// Pre-check: user must have sufficient available balance (BS-01, BS-07).
 func (jg *JournalGenerator) GenerateWithdrawalRequested(
 	userID uuid.UUID,
 	withdrawalID uuid.UUID,
@@ -270,8 +341,6 @@ func (jg *JournalGenerator) GenerateTradeFill(
 	return batch, nil
 }
 
-// internal/ledger/generator.go (UPDATE - add funding methods)
-
 // GenerateFundingSettlement creates journals for all positions in funding epoch
 func (jg *JournalGenerator) GenerateFundingSettlement(
 	settlement *fpmath.FundingSettlement,
@@ -449,6 +518,46 @@ func (jg *JournalGenerator) generateFundingWithDeficit(
 	}
 
 	jg.sequence++
+	return batch, nil
+}
+
+// GenerateInsuranceCoverage creates journals for insurance fund covering a liquidation deficit.
+// Per doc §9: when a liquidation results in bankruptcy (deficit > 0), the insurance fund
+// covers the shortfall by transferring from system:insurance_fund to user:collateral.
+func (jg *JournalGenerator) GenerateInsuranceCoverage(
+	userID uuid.UUID,
+	liquidationID uuid.UUID,
+	coverageAmount int64,
+	quoteAssetID AssetID,
+	timestamp int64,
+) (*Batch, error) {
+	batchID := uuid.New()
+	eventRef := fmt.Sprintf("%s:insurance", liquidationID)
+
+	batch := &Batch{
+		BatchID:   batchID,
+		EventRef:  eventRef,
+		Sequence:  jg.sequence,
+		Timestamp: timestamp,
+		Journals:  make([]Journal, 0, 1),
+	}
+
+	journal := Journal{
+		JournalID:     uuid.New(),
+		BatchID:       batchID,
+		EventRef:      eventRef,
+		Sequence:      jg.sequence,
+		DebitAccount:  NewUserAccountKey(userID, SubTypeCollateral, quoteAssetID),
+		CreditAccount: NewSystemAccountKey("insurance", SubTypeSystemInsuranceFund, quoteAssetID),
+		AssetID:       quoteAssetID,
+		Amount:        coverageAmount,
+		JournalType:   JournalTypeInsuranceFundDebit,
+		Timestamp:     timestamp,
+	}
+
+	batch.Journals = append(batch.Journals, journal)
+	jg.sequence++
+
 	return batch, nil
 }
 

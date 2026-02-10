@@ -1,4 +1,3 @@
-// internal/state/position.go (UPDATE)
 package state
 
 import (
@@ -56,6 +55,7 @@ func (ls LiquidationState) CanTransitionTo(next LiquidationState) bool {
 	validTransitions := map[LiquidationState][]LiquidationState{
 		LiquidationStateHealthy: {
 			LiquidationStateAtRisk,
+			LiquidationStateInLiquidation, // Direct trigger when margin < MM
 		},
 		LiquidationStateAtRisk: {
 			LiquidationStateHealthy,

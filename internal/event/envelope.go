@@ -1,4 +1,3 @@
-// internal/event/envelope.go
 package event
 
 import (
@@ -96,6 +95,8 @@ func (et EventType) String() string {
 		return "LiquidationFill"
 	case EventTypeLiquidationCompleted:
 		return "LiquidationCompleted"
+	case EventTypeRiskParamUpdate:
+		return "RiskParamUpdate"
 	default:
 		return "Unknown"
 	}

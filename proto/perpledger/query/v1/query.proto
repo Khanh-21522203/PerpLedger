@@ -1,0 +1,365 @@
+syntax = "proto3";
+
+package perpledger.query.v1;
+
+option go_package = "PerpLedger/gen/go/perpledger/query/v1;queryv1";
+
+import "google/api/annotations.proto";
+import "perpledger/events/v1/events.proto";
+
+// QueryService provides read-only access to projection tables.
+// Per doc §16: queries are served via gRPC and HTTP/JSON (gRPC-Gateway).
+service QueryService {
+  // Account & Balance queries
+  rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/balances"
+    };
+  }
+
+  rpc GetBalanceSummary(GetBalanceSummaryRequest) returns (GetBalanceSummaryResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/balance-summary"
+    };
+  }
+
+  // Position queries
+  rpc GetPosition(GetPositionRequest) returns (GetPositionResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/positions/{market_id}"
+    };
+  }
+
+  rpc ListPositions(ListPositionsRequest) returns (ListPositionsResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/positions"
+    };
+  }
+
+  // Margin queries
+  rpc GetMarginSnapshot(GetMarginSnapshotRequest) returns (GetMarginSnapshotResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/margin"
+    };
+  }
+
+  // Funding queries
+  rpc ListFundingHistory(ListFundingHistoryRequest) returns (ListFundingHistoryResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/funding"
+    };
+  }
+
+  // Liquidation queries
+  rpc GetLiquidationStatus(GetLiquidationStatusRequest) returns (GetLiquidationStatusResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/liquidations/{market_id}"
+    };
+  }
+
+  rpc ListLiquidationHistory(ListLiquidationHistoryRequest) returns (ListLiquidationHistoryResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}/liquidations"
+    };
+  }
+
+  // Journal / audit queries
+  rpc ListJournals(ListJournalsRequest) returns (ListJournalsResponse) {
+    option (google.api.http) = {
+      get: "/v1/journals"
+    };
+  }
+
+  // System health
+  rpc GetSystemStatus(GetSystemStatusRequest) returns (GetSystemStatusResponse) {
+    option (google.api.http) = {
+      get: "/v1/admin/status"
+    };
+  }
+}
+
+// --- Request / Response Messages ---
+
+// GetBalances
+message GetBalancesRequest {
+  string user_id = 1;
+}
+
+message GetBalancesResponse {
+  repeated AssetBalance balances = 1;
+  int64 as_of_sequence = 2;
+  int64 freshness_ms = 3;
+}
+
+message AssetBalance {
+  string asset = 1;
+  int64 total_balance = 2;
+  int64 available_balance = 3;
+  int64 reserved_balance = 4;
+  int64 pending_deposit = 5;
+  int64 pending_withdrawal = 6;
+}
+
+// GetBalanceSummary
+message GetBalanceSummaryRequest {
+  string user_id = 1;
+}
+
+message GetBalanceSummaryResponse {
+  string user_id = 1;
+  int64 total_collateral = 2;
+  int64 available_collateral = 3;
+  int64 total_unrealized_pnl = 4;
+  int64 effective_equity = 5;
+  int64 total_notional = 6;
+  int64 total_initial_margin = 7;
+  int64 total_maintenance_margin = 8;
+  int64 margin_fraction = 9;       // scale=1_000_000
+  int64 liquidation_buffer = 10;
+  repeated AssetBalance balances = 11;
+  repeated PositionSummary positions = 12;
+  int64 as_of_sequence = 13;
+  int64 freshness_ms = 14;
+}
+
+message PositionSummary {
+  string market_id = 1;
+  perpledger.events.v1.Side side = 2;
+  int64 size = 3;
+  int64 avg_entry_price = 4;
+  int64 mark_price = 5;
+  int64 unrealized_pnl = 6;
+  int64 notional = 7;
+  int64 initial_margin = 8;
+  int64 maintenance_margin = 9;
+  string liquidation_state = 10;
+}
+
+// GetPosition
+message GetPositionRequest {
+  string user_id = 1;
+  string market_id = 2;
+}
+
+message GetPositionResponse {
+  Position position = 1;
+  int64 mark_price = 2;
+  int64 unrealized_pnl = 3;
+  int64 notional = 4;
+  int64 liquidation_price = 5;
+  int64 as_of_sequence = 6;
+  int64 freshness_ms = 7;
+}
+
+message Position {
+  string user_id = 1;
+  string market_id = 2;
+  perpledger.events.v1.Side side = 3;
+  int64 size = 4;
+  int64 avg_entry_price = 5;
+  int64 realized_pnl = 6;
+  int64 last_funding_epoch = 7;
+  string liquidation_state = 8;
+  string liquidation_id = 9;
+}
+
+// ListPositions
+message ListPositionsRequest {
+  string user_id = 1;
+  string market_id = 2;          // optional filter
+  string liquidation_state = 3;  // optional filter
+  bool active_only = 4;
+  int32 page_size = 5;
+  string page_token = 6;
+}
+
+message ListPositionsResponse {
+  repeated PositionWithDerived positions = 1;
+  string next_page_token = 2;
+  int64 as_of_sequence = 3;
+  int64 freshness_ms = 4;
+}
+
+message PositionWithDerived {
+  Position position = 1;
+  int64 mark_price = 2;
+  int64 unrealized_pnl = 3;
+  int64 notional = 4;
+  int64 initial_margin = 5;
+  int64 maintenance_margin = 6;
+  int64 margin_fraction = 7;
+}
+
+// GetMarginSnapshot
+message GetMarginSnapshotRequest {
+  string user_id = 1;
+}
+
+message GetMarginSnapshotResponse {
+  string user_id = 1;
+  repeated CollateralItem collateral_items = 2;
+  int64 total_effective_collateral = 3;
+  repeated MarginPositionItem position_items = 4;
+  int64 total_notional = 5;
+  int64 total_initial_margin = 6;
+  int64 total_maintenance_margin = 7;
+  int64 margin_fraction = 8;       // scale=1_000_000
+  string margin_status = 9;        // "healthy", "at_risk", "in_liquidation"
+  int64 liquidation_buffer = 10;
+  int64 available_for_new_positions = 11;
+  int64 as_of_sequence = 12;
+  int64 freshness_ms = 13;
+}
+
+message CollateralItem {
+  string asset = 1;
+  int64 balance = 2;
+  int64 mark_price = 3;
+  int64 haircut = 4;               // scale=1_000_000
+  int64 effective_value = 5;
+}
+
+message MarginPositionItem {
+  string market_id = 1;
+  perpledger.events.v1.Side side = 2;
+  int64 size = 3;
+  int64 mark_price = 4;
+  int64 notional = 5;
+  int64 unrealized_pnl = 6;
+  int64 initial_margin = 7;
+  int64 maintenance_margin = 8;
+  int64 im_fraction = 9;
+  int64 mm_fraction = 10;
+}
+
+// ListFundingHistory
+message ListFundingHistoryRequest {
+  string user_id = 1;
+  string market_id = 2;          // optional filter
+  int64 from_epoch_id = 3;
+  int64 to_epoch_id = 4;
+  int32 page_size = 5;
+  string page_token = 6;
+}
+
+message ListFundingHistoryResponse {
+  repeated FundingPayment payments = 1;
+  string next_page_token = 2;
+  int64 total_paid = 3;
+  int64 total_received = 4;
+  int64 as_of_sequence = 5;
+  int64 freshness_ms = 6;
+}
+
+message FundingPayment {
+  string market_id = 1;
+  int64 epoch_id = 2;
+  int64 funding_rate = 3;        // scale=100_000_000, signed
+  int64 position_size = 4;
+  perpledger.events.v1.Side position_side = 5;
+  int64 mark_price = 6;
+  int64 payment = 7;             // signed: positive = paid, negative = received
+  string journal_id = 8;
+  int64 timestamp_us = 9;
+}
+
+// GetLiquidationStatus
+message GetLiquidationStatusRequest {
+  string user_id = 1;
+  string market_id = 2;
+}
+
+message GetLiquidationStatusResponse {
+  string liquidation_id = 1;
+  string state = 2;
+  int64 original_size = 3;
+  int64 remaining_size = 4;
+  int64 deficit = 5;
+  repeated LiquidationFillInfo fills = 6;
+  int64 initiated_sequence = 7;
+  int64 as_of_sequence = 8;
+  int64 freshness_ms = 9;
+}
+
+message LiquidationFillInfo {
+  string fill_id = 1;
+  int64 quantity = 2;
+  int64 price = 3;
+  int64 realized_pnl = 4;
+  int64 timestamp_us = 5;
+}
+
+// ListLiquidationHistory
+message ListLiquidationHistoryRequest {
+  string user_id = 1;
+  string market_id = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListLiquidationHistoryResponse {
+  repeated LiquidationRecord records = 1;
+  string next_page_token = 2;
+  int64 as_of_sequence = 3;
+  int64 freshness_ms = 4;
+}
+
+message LiquidationRecord {
+  string liquidation_id = 1;
+  string market_id = 2;
+  string final_state = 3;
+  int64 original_size = 4;
+  int64 total_realized_pnl = 5;
+  int64 deficit = 6;
+  int32 fill_count = 7;
+  int64 initiated_timestamp_us = 8;
+  int64 completed_timestamp_us = 9;
+}
+
+// ListJournals
+message ListJournalsRequest {
+  string user_id = 1;
+  string market_id = 2;
+  string journal_type = 3;
+  int64 from_sequence = 4;
+  int64 to_sequence = 5;
+  int32 page_size = 6;
+  string page_token = 7;
+}
+
+message ListJournalsResponse {
+  repeated JournalRecord journals = 1;
+  string next_page_token = 2;
+  int64 as_of_sequence = 3;
+  int64 freshness_ms = 4;
+}
+
+message JournalRecord {
+  string journal_id = 1;
+  string batch_id = 2;
+  int64 event_sequence = 3;
+  string debit_account = 4;
+  string credit_account = 5;
+  string asset = 6;
+  int64 amount = 7;
+  string journal_type = 8;
+  int64 timestamp_us = 9;
+}
+
+// GetSystemStatus
+message GetSystemStatusRequest {}
+
+message GetSystemStatusResponse {
+  int64 core_sequence = 1;
+  int64 persist_sequence = 2;
+  int64 projection_sequence = 3;
+  int64 inbound_channel_size = 4;
+  int64 persist_channel_size = 5;
+  int64 projection_channel_size = 6;
+  int64 uptime_seconds = 7;
+  string state = 8;
+  int64 last_snapshot_sequence = 9;
+  int64 events_since_snapshot = 10;
+  map<string, int64> latest_mark_prices = 11;
+  map<string, int64> latest_funding_epochs = 12;
+}

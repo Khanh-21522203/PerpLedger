@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package perpledger.ingest.v1;
+
+option go_package = "PerpLedger/gen/go/perpledger/ingest/v1;ingestv1";
+
+import "google/api/annotations.proto";
+import "perpledger/events/v1/events.proto";
+
+// IngestService provides admin/manual event injection via gRPC.
+// Per doc §15: secondary transport for admin operations, risk param updates, and backfill.
+service IngestService {
+  // Submit a single event (admin use).
+  rpc SubmitEvent(SubmitEventRequest) returns (SubmitEventResponse) {
+    option (google.api.http) = {
+      post: "/v1/admin/events"
+      body: "*"
+    };
+  }
+
+  // Update risk parameters for a market.
+  rpc UpdateRiskParams(perpledger.events.v1.RiskParamUpdate) returns (UpdateRiskParamsResponse) {
+    option (google.api.http) = {
+      put: "/v1/admin/risk-params/{market_id}"
+      body: "*"
+    };
+  }
+
+  // Inject a backfill event (for gap recovery).
+  rpc BackfillEvent(BackfillEventRequest) returns (BackfillEventResponse) {
+    option (google.api.http) = {
+      post: "/v1/admin/backfill"
+      body: "*"
+    };
+  }
+}
+
+message SubmitEventRequest {
+  perpledger.events.v1.EventEnvelope envelope = 1;
+}
+
+message SubmitEventResponse {
+  bool accepted = 1;
+  string rejection_reason = 2;  // empty if accepted
+  int64 assigned_sequence = 3;  // global sequence assigned by core (0 if rejected)
+}
+
+message UpdateRiskParamsResponse {
+  bool accepted = 1;
+  string rejection_reason = 2;
+}
+
+message BackfillEventRequest {
+  perpledger.events.v1.EventEnvelope envelope = 1;
+  string admin_token = 2;       // required for backfill
+  string justification = 3;     // audit log
+}
+
+message BackfillEventResponse {
+  bool accepted = 1;
+  string rejection_reason = 2;
+}

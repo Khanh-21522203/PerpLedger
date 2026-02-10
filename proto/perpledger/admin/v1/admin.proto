@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package perpledger.admin.v1;
+
+option go_package = "PerpLedger/gen/go/perpledger/admin/v1;adminv1";
+
+import "google/api/annotations.proto";
+
+// AdminService provides operator/admin APIs for system management.
+// Per doc §16: all admin endpoints require admin role (mTLS or API key).
+service AdminService {
+  // Trigger a snapshot.
+  rpc TakeSnapshot(TakeSnapshotRequest) returns (TakeSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/v1/admin/snapshot"
+      body: "*"
+    };
+  }
+
+  // Trigger projection rebuild.
+  rpc RebuildProjections(RebuildProjectionsRequest) returns (RebuildProjectionsResponse) {
+    option (google.api.http) = {
+      post: "/v1/admin/rebuild-projections"
+      body: "*"
+    };
+  }
+
+  // Get event log info.
+  rpc GetEventLogInfo(GetEventLogInfoRequest) returns (GetEventLogInfoResponse) {
+    option (google.api.http) = {
+      get: "/v1/admin/event-log-info"
+    };
+  }
+
+  // Verify integrity.
+  rpc VerifyIntegrity(VerifyIntegrityRequest) returns (VerifyIntegrityResponse) {
+    option (google.api.http) = {
+      post: "/v1/admin/verify-integrity"
+      body: "*"
+    };
+  }
+}
+
+message TakeSnapshotRequest {}
+
+message TakeSnapshotResponse {
+  string snapshot_id = 1;
+  int64 sequence = 2;
+  int64 size_bytes = 3;
+}
+
+message RebuildProjectionsRequest {
+  string projection_name = 1;    // empty = all projections
+  int64 from_sequence = 2;       // 0 = from genesis
+}
+
+message RebuildProjectionsResponse {
+  bool started = 1;
+  string task_id = 2;
+}
+
+message GetEventLogInfoRequest {}
+
+message GetEventLogInfoResponse {
+  int64 first_sequence = 1;
+  int64 last_sequence = 2;
+  int64 total_events = 3;
+  int64 total_journals = 4;
+  int64 oldest_event_timestamp_us = 5;
+  int64 newest_event_timestamp_us = 6;
+  int32 partition_count = 7;
+}
+
+message VerifyIntegrityRequest {
+  int64 from_sequence = 1;       // 0 = from last snapshot
+  int64 to_sequence = 2;         // 0 = to head
+}
+
+message VerifyIntegrityResponse {
+  bool passed = 1;
+  int64 events_verified = 2;
+  int64 first_mismatch_sequence = 3;  // 0 if passed
+  string error_detail = 4;
+}

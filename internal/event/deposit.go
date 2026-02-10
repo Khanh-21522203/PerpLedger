@@ -1,14 +1,20 @@
-// internal/event/deposit.go
 package event
 
-import "github.com/google/uuid"
+import (
+	"time"
 
+	"github.com/google/uuid"
+)
+
+// DepositInitiated represents a deposit that has been submitted but not yet confirmed.
+// Moves funds: external:deposits → user:pending_deposit.
 type DepositInitiated struct {
 	DepositID uuid.UUID
 	UserID    uuid.UUID
 	Asset     string
-	Amount    int64 // Fixed-point
-	Sequence  int64
+	Amount    int64     // Fixed-point: asset scale, must be > 0
+	Sequence  int64     // Source sequence
+	Timestamp time.Time // Versioned input timestamp
 }
 
 func (d *DepositInitiated) IdempotencyKey() string {
@@ -27,12 +33,15 @@ func (d *DepositInitiated) SourceSequence() int64 {
 	return d.Sequence
 }
 
+// DepositConfirmed represents a deposit that has been confirmed on-chain.
+// Moves funds: external:deposits → user:collateral (or pending_deposit → collateral).
 type DepositConfirmed struct {
 	DepositID uuid.UUID
 	UserID    uuid.UUID
 	Asset     string
-	Amount    int64
-	Sequence  int64
+	Amount    int64     // Fixed-point: asset scale, must be > 0
+	Sequence  int64     // Source sequence
+	Timestamp time.Time // Versioned input timestamp
 }
 
 func (d *DepositConfirmed) IdempotencyKey() string {

@@ -1,4 +1,3 @@
-// internal/core/engine.go (UPDATE)
 package core
 
 import (
@@ -87,7 +86,7 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 
 	// Special handling for price updates (gaps tolerated)
 	if priceEvt, ok := evt.(*event.MarkPriceUpdate); ok {
-		if err := c.sequenceValidator.ValidatePriceSequence(priceEvt.MarketID, priceEvt.PriceSequence); err != nil {
+		if err := c.sequenceValidator.ValidatePriceSequence(priceEvt.Market, priceEvt.PriceSequence); err != nil {
 			return err
 		}
 	} else {
@@ -167,17 +166,19 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 	}
 
 	// Step 11: Emit outputs
+	// Per doc §12 (Concurrency): persist channel uses BLOCKING send (backpressure),
+	// projection channel uses NON-BLOCKING send with silent drop.
 	for _, output := range outputs {
-		select {
-		case c.persistChan <- output:
-		default:
-			return fmt.Errorf("persist channel full")
-		}
+		// Persistence: blocking send — the core stalls until the persistence
+		// worker drains. This guarantees no event is lost.
+		c.persistChan <- output
 
+		// Projections: non-blocking send — drop on full. Projection workers
+		// can rebuild from the event log if they fall behind.
 		select {
 		case c.projectionChan <- output:
 		default:
-			return fmt.Errorf("projection channel full")
+			// Silently dropped — projection will catch up via rebuild
 		}
 	}
 
@@ -215,7 +216,7 @@ func (c *DeterministicCore) getEventTimestamp(evt event.Event) time.Time {
 		return time.UnixMicro(e.EpochTs)
 	case *event.FundingEpochSettle:
 		// Get timestamp from stored snapshot
-		if snapshot, ok := c.fundingManager.GetFundingSnapshot(e.MarketID, e.EpochID); ok {
+		if snapshot, ok := c.fundingManager.GetFundingSnapshot(e.Market, e.EpochID); ok {
 			return time.UnixMicro(snapshot.Timestamp)
 		}
 		return time.Now() // Fallback (should not happen)
@@ -303,12 +304,21 @@ func (c *DeterministicCore) postCheckInvariants(evt event.Event) error {
 	case *event.FundingEpochSettle:
 		// Check funding pool is zero (INVARIANT L-07)
 		quoteAssetID, _ := ledger.GetAssetID("USDT")
-		if err := c.validator.ValidateFundingPoolZero(e.MarketID, quoteAssetID); err != nil {
+		if err := c.validator.ValidateFundingPoolZero(e.Market, quoteAssetID); err != nil {
 			return fmt.Errorf("post-check L-07: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func (c *DeterministicCore) handleDepositInitiated(evt *event.DepositInitiated) (*ledger.Batch, error) {
+	assetID, ok := ledger.GetAssetID(evt.Asset)
+	if !ok {
+		return nil, fmt.Errorf("unknown asset: %s", evt.Asset)
+	}
+
+	return c.journalGen.GenerateDepositInitiated(evt, assetID)
 }
 
 func (c *DeterministicCore) handleDepositConfirmed(evt *event.DepositConfirmed) (*ledger.Batch, error) {
@@ -318,17 +328,6 @@ func (c *DeterministicCore) handleDepositConfirmed(evt *event.DepositConfirmed) 
 	}
 
 	return c.journalGen.GenerateDepositConfirmed(evt, assetID)
-}
-
-func (c *DeterministicCore) computeStateDigest(batch *ledger.Batch) []byte {
-	digest := make([]byte, 0, 1024)
-
-	for _, j := range batch.Journals {
-		digest = append(digest, j.DebitAccount.AccountPath()...)
-		digest = append(digest, j.CreditAccount.AccountPath()...)
-	}
-
-	return digest
 }
 
 // handleTradeFill with pre-trade margin check
@@ -426,12 +425,12 @@ func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch
 	)
 }
 
-// handleMarkPriceUpdate processes mark price update
-// handleMarkPriceUpdate with margin check
+// handleMarkPriceUpdate processes mark price update and triggers margin checks.
+// Mark price updates do NOT generate journal entries — they only mutate in-memory
+// state (mark price cache) and may trigger liquidation side-effects.
 func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*ledger.Batch, error) {
-	// Update mark price
 	err := c.positionManager.UpdateMarkPrice(
-		evt.MarketID,
+		evt.Market,
 		evt.MarkPrice,
 		evt.PriceSequence,
 		evt.PriceTimestamp,
@@ -442,7 +441,7 @@ func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*
 	}
 
 	// Trigger margin checks for all positions in this market
-	c.checkMarginForMarket(evt.MarketID)
+	c.checkMarginForMarket(evt.Market)
 
 	// Return empty batch (mark price doesn't generate journals)
 	return &ledger.Batch{
@@ -511,7 +510,8 @@ func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string
 	_ = liquidationID
 }
 
-// handleLiquidationFill processes liquidation fill
+// handleLiquidationFill processes a liquidation fill from the liquidation engine.
+// Liquidation fills always CLOSE positions (never open), so marginReserve = 0.
 func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*ledger.Batch, error) {
 	quoteAssetID, _ := ledger.GetAssetID("USDT")
 
@@ -524,7 +524,7 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 	// Process fill in position manager
 	realizedPnL, _, _ := c.positionManager.ApplyTradeFill(
 		evt.UserID,
-		evt.MarketID,
+		evt.Market,
 		evt.Side,
 		evt.Quantity,
 		evt.Price,
@@ -537,14 +537,15 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 
 	// Calculate proportional margin release
 	reserved := c.balanceTracker.GetUserReservedBalance(evt.UserID, quoteAssetID)
-	pos := c.positionManager.GetPosition(evt.UserID, evt.MarketID)
+	pos := c.positionManager.GetPosition(evt.UserID, evt.Market)
 
 	var marginRelease int64
 	if pos != nil && !pos.IsFlat() {
+		// TRICKY: pos.Size is AFTER the fill was applied, so originalSize = current + filled
 		originalSize := pos.Size + evt.Quantity
 		marginRelease = reserved * evt.Quantity / originalSize
 	} else {
-		// Fully liquidated - release all
+		// Fully liquidated - release all remaining reserved margin
 		marginRelease = reserved
 	}
 
@@ -552,7 +553,7 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 	batch, err := c.journalGen.GenerateTradeFill(
 		evt.UserID,
 		evt.FillID,
-		evt.MarketID,
+		evt.Market,
 		false, // Liquidation is always closing
 		evt.Fee,
 		0, // No reserve
@@ -566,7 +567,7 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 		return nil, err
 	}
 
-	// POST-FILL: Check if margin recovered
+	// POST-FILL: Check if margin recovered after partial liquidation
 	marginStatus := c.marginCalc.CheckMarginHealth(evt.UserID, quoteAssetID)
 	if marginStatus == state.MarginStatusHealthy {
 		c.liquidationMgr.CheckMarginRecovery(evt.LiquidationID, true)
@@ -575,11 +576,12 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 	return batch, nil
 }
 
-// handleFundingRateSnapshot stores the funding snapshot
+// handleFundingRateSnapshot stores the funding snapshot for later settlement.
+// No journal entries are generated — this only records state for the upcoming
+// FundingEpochSettle event.
 func (c *DeterministicCore) handleFundingRateSnapshot(evt *event.FundingRateSnapshot) (*ledger.Batch, error) {
-	// Validate and store snapshot
 	err := c.fundingManager.StoreFundingSnapshot(
-		evt.MarketID,
+		evt.Market,
 		evt.EpochID,
 		evt.FundingRate,
 		evt.MarkPrice,
@@ -600,25 +602,27 @@ func (c *DeterministicCore) handleFundingRateSnapshot(evt *event.FundingRateSnap
 	}, nil
 }
 
-// handleFundingEpochSettle executes funding settlement
+// handleFundingEpochSettle executes funding settlement for all positions in a market.
+// TRICKY: This returns multiple batches (one per user + optional rounding batch).
+// The batches are NOT applied here — they are returned to ProcessEvent which
+// applies them via the standard pipeline (validate → apply → hash → emit).
 func (c *DeterministicCore) handleFundingEpochSettle(evt *event.FundingEpochSettle) ([]*ledger.Batch, error) {
 	// Retrieve stored snapshot
-	snapshot, ok := c.fundingManager.GetFundingSnapshot(evt.MarketID, evt.EpochID)
+	snapshot, ok := c.fundingManager.GetFundingSnapshot(evt.Market, evt.EpochID)
 	if !ok {
-		return nil, fmt.Errorf("no funding snapshot for %s epoch %d", evt.MarketID, evt.EpochID)
+		return nil, fmt.Errorf("no funding snapshot for %s epoch %d", evt.Market, evt.EpochID)
 	}
 
 	// Collect all positions in this market
-	positions := c.collectPositionsForFunding(evt.MarketID)
+	positions := c.collectPositionsForFunding(evt.Market)
 
 	if len(positions) == 0 {
-		// No positions - no settlement needed
 		return []*ledger.Batch{}, nil
 	}
 
-	// Compute funding settlement
+	// Compute funding settlement (deterministic: positions sorted by user_id)
 	settlement := fpmath.ComputeFundingSettlement(
-		evt.MarketID,
+		evt.Market,
 		evt.EpochID,
 		snapshot.FundingRate,
 		snapshot.MarkPrice,
@@ -637,25 +641,14 @@ func (c *DeterministicCore) handleFundingEpochSettle(evt *event.FundingEpochSett
 		return nil, fmt.Errorf("funding settlement generation failed: %w", err)
 	}
 
-	// Apply all batches
-	for _, batch := range batches {
-		// Validate batch balance
-		if err := c.validator.ValidateBatchBalance(batch); err != nil {
-			panic(fmt.Sprintf("FATAL: unbalanced funding batch: %v", err))
+	// Update LastFundingEpoch on all settled positions.
+	// Per doc §8: prevents double-settlement if the same epoch is replayed.
+	allPositions := c.positionManager.GetAllPositions()
+	for _, pos := range allPositions {
+		if pos.MarketID == evt.Market && !pos.IsFlat() {
+			pos.LastFundingEpoch = evt.EpochID
+			pos.Version++
 		}
-
-		// Apply to balances
-		if err := c.balanceTracker.ApplyBatch(batch); err != nil {
-			return nil, fmt.Errorf("apply funding batch failed: %w", err)
-		}
-	}
-
-	// POST-CHECK: Verify funding pool is zero (INVARIANT L-07)
-	fundingPoolKey := ledger.NewSystemAccountKey(evt.MarketID, ledger.SubTypeSystemFundingPool, quoteAssetID)
-	fundingPoolBalance := c.balanceTracker.GetBalance(fundingPoolKey)
-
-	if fundingPoolBalance != 0 {
-		panic(fmt.Sprintf("FATAL: funding pool not zero after settlement: %d", fundingPoolBalance))
 	}
 
 	return batches, nil
@@ -724,9 +717,75 @@ func (c *DeterministicCore) handleWithdrawalRejected(evt *event.WithdrawalReject
 	)
 }
 
-// Update dispatchEvent
+// handleLiquidationCompleted processes the completion of a liquidation.
+// Per doc §9: if deficit > 0, bankruptcy occurred and the insurance fund covers it.
+// If the insurance fund is insufficient, the system should escalate to ADL.
+func (c *DeterministicCore) handleLiquidationCompleted(evt *event.LiquidationCompleted) (*ledger.Batch, error) {
+	quoteAssetID, _ := ledger.GetAssetID("USDT")
+
+	// Verify liquidation exists
+	liq, ok := c.liquidationMgr.GetActiveLiquidation(evt.LiquidationID)
+	if !ok {
+		return nil, fmt.Errorf("unknown liquidation_id: %s", evt.LiquidationID)
+	}
+
+	pos := c.positionManager.GetPosition(liq.UserID, liq.MarketID)
+	if pos != nil {
+		// Transition to Closed
+		if pos.LiquidationState.CanTransitionTo(state.LiquidationStateClosed) {
+			pos.LiquidationState = state.LiquidationStateClosed
+			pos.Version++
+		}
+	}
+
+	if evt.Deficit <= 0 {
+		// No deficit — clean completion, no journal entries needed
+		return &ledger.Batch{
+			BatchID:  uuid.New(),
+			EventRef: evt.IdempotencyKey(),
+			Sequence: c.sequence,
+			Timestamp: evt.Timestamp,
+			Journals: []ledger.Journal{},
+		}, nil
+	}
+
+	// Deficit > 0: bankruptcy occurred.
+	// Insurance fund covers the shortfall.
+	insuranceFundKey := ledger.NewSystemAccountKey("insurance", ledger.SubTypeCollateral, quoteAssetID)
+	insuranceBalance := c.balanceTracker.GetBalance(insuranceFundKey)
+
+	covered := evt.Deficit
+	if insuranceBalance < evt.Deficit {
+		// Insurance fund insufficient — cover what we can.
+		// TRICKY: remaining deficit should trigger ADL escalation (post-MVP).
+		covered = insuranceBalance
+	}
+
+	if covered > 0 {
+		// Generate insurance fund coverage journal
+		return c.journalGen.GenerateInsuranceCoverage(
+			liq.UserID,
+			evt.LiquidationID,
+			covered,
+			quoteAssetID,
+			evt.Timestamp,
+		)
+	}
+
+	// No coverage possible — empty batch
+	return &ledger.Batch{
+		BatchID:  uuid.New(),
+		EventRef: evt.IdempotencyKey(),
+		Sequence: c.sequence,
+		Timestamp: evt.Timestamp,
+		Journals: []ledger.Journal{},
+	}, nil
+}
+
 func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error) {
 	switch e := evt.(type) {
+	case *event.DepositInitiated:
+		return c.handleDepositInitiated(e)
 	case *event.DepositConfirmed:
 		return c.handleDepositConfirmed(e)
 	case *event.WithdrawalRequested:
@@ -743,6 +802,8 @@ func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error
 		return c.handleFundingRateSnapshot(e)
 	case *event.LiquidationFill:
 		return c.handleLiquidationFill(e)
+	case *event.LiquidationCompleted:
+		return c.handleLiquidationCompleted(e)
 	default:
 		return nil, fmt.Errorf("unknown event type: %T", evt)
 	}

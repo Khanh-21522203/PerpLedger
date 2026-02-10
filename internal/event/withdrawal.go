@@ -1,4 +1,3 @@
-// internal/event/withdrawal.go (NEW)
 package event
 
 import (

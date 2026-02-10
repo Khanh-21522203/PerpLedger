@@ -1,4 +1,3 @@
-// internal/state/funding_manager.go (NEW)
 package state
 
 import (

@@ -1,8 +1,8 @@
-// internal/state/liquidation_manager.go (NEW)
 package state
 
 import (
 	"fmt"
+
 	"github.com/google/uuid"
 )
 
@@ -40,10 +40,9 @@ func (lm *LiquidationManager) TriggerLiquidation(
 		return uuid.Nil, fmt.Errorf("no position to liquidate")
 	}
 
-	// Check current state allows triggering
-	if pos.LiquidationState != LiquidationStateHealthy &&
-		pos.LiquidationState != LiquidationStateAtRisk {
-		return uuid.Nil, fmt.Errorf("position already in liquidation")
+	// Check current state allows triggering (Healthy or AtRisk → InLiquidation)
+	if !pos.LiquidationState.CanTransitionTo(LiquidationStateInLiquidation) {
+		return uuid.Nil, fmt.Errorf("cannot trigger liquidation from state %s", pos.LiquidationState)
 	}
 
 	liquidationID := uuid.New()
@@ -55,12 +54,13 @@ func (lm *LiquidationManager) TriggerLiquidation(
 		TriggeredAt:   sequence,
 		InitialSize:   pos.Size,
 		RemainingSize: pos.Size,
-		State:         LiquidationStateAtRisk,
+		State:         LiquidationStateInLiquidation,
 	}
 
 	// Update position state
-	pos.LiquidationState = LiquidationStateAtRisk
-	pos.LiquidationID = &liquidationID
+	pos.LiquidationState = LiquidationStateInLiquidation
+	lidStr := liquidationID.String()
+	pos.LiquidationID = &lidStr
 	pos.Version++
 
 	return liquidationID, nil

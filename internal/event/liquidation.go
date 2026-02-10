@@ -1,18 +1,19 @@
-// internal/event/liquidation.go (NEW)
 package event
 
 import (
 	"fmt"
+
 	"github.com/google/uuid"
 )
 
-// LiquidationTriggered emitted when margin < MM
+// LiquidationTriggered emitted when margin fraction < MM fraction.
+// Published to NATS for the liquidation engine to begin unwinding.
 type LiquidationTriggered struct {
 	LiquidationID uuid.UUID
 	UserID        uuid.UUID
-	MarketID      string
+	Market        string // Market identifier
 	Sequence      int64
-	Timestamp     int64
+	Timestamp     int64 // Epoch microseconds
 }
 
 func (l *LiquidationTriggered) IdempotencyKey() string {
@@ -24,25 +25,27 @@ func (l *LiquidationTriggered) EventType() EventType {
 }
 
 func (l *LiquidationTriggered) MarketID() *string {
-	return &l.MarketID
+	s := l.Market
+	return &s
 }
 
 func (l *LiquidationTriggered) SourceSequence() int64 {
 	return l.Sequence
 }
 
-// LiquidationFill represents a fill from liquidation engine
+// LiquidationFill represents a fill from the liquidation engine.
+// Idempotency key: "{liquidation_id}:{fill_id}" (per doc §3.8).
 type LiquidationFill struct {
 	LiquidationID uuid.UUID
 	FillID        uuid.UUID
 	UserID        uuid.UUID
-	MarketID      string
-	Side          Side
-	Quantity      int64
-	Price         int64
-	Fee           int64
+	Market        string // Market identifier
+	Side          Side   // Closing side
+	Quantity      int64  // Fixed-point: quantity scale
+	Price         int64  // Fixed-point: price scale
+	Fee           int64  // Fixed-point: quote scale
 	Sequence      int64
-	Timestamp     int64
+	Timestamp     int64 // Epoch microseconds
 }
 
 func (l *LiquidationFill) IdempotencyKey() string {
@@ -54,21 +57,23 @@ func (l *LiquidationFill) EventType() EventType {
 }
 
 func (l *LiquidationFill) MarketID() *string {
-	return &l.MarketID
+	s := l.Market
+	return &s
 }
 
 func (l *LiquidationFill) SourceSequence() int64 {
 	return l.Sequence
 }
 
-// LiquidationCompleted marks liquidation as finished
+// LiquidationCompleted marks liquidation as finished.
+// If Deficit > 0, bankruptcy occurred and insurance fund was tapped.
 type LiquidationCompleted struct {
 	LiquidationID uuid.UUID
 	UserID        uuid.UUID
-	MarketID      string
-	Deficit       int64 // If positive, bankruptcy occurred
+	Market        string // Market identifier
+	Deficit       int64  // If positive, bankruptcy occurred
 	Sequence      int64
-	Timestamp     int64
+	Timestamp     int64 // Epoch microseconds
 }
 
 func (l *LiquidationCompleted) IdempotencyKey() string {
@@ -80,7 +85,8 @@ func (l *LiquidationCompleted) EventType() EventType {
 }
 
 func (l *LiquidationCompleted) MarketID() *string {
-	return &l.MarketID
+	s := l.Market
+	return &s
 }
 
 func (l *LiquidationCompleted) SourceSequence() int64 {
