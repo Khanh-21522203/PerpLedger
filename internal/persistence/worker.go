@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"PerpLedger/internal/observability"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -24,6 +25,7 @@ type PersistenceWorker struct {
 	inputChan    <-chan CoreOutput
 	batchSize    int
 	flushTimeout time.Duration
+	metrics      *observability.Metrics
 }
 
 func NewPersistenceWorker(
@@ -31,12 +33,14 @@ func NewPersistenceWorker(
 	inputChan <-chan CoreOutput,
 	batchSize int,
 	flushTimeout time.Duration,
+	metrics *observability.Metrics,
 ) *PersistenceWorker {
 	return &PersistenceWorker{
 		writer:       NewEventLogWriter(db, batchSize, flushTimeout),
 		inputChan:    inputChan,
 		batchSize:    batchSize,
 		flushTimeout: flushTimeout,
+		metrics:      metrics,
 	}
 }
 
@@ -102,22 +106,51 @@ func (pw *PersistenceWorker) Run(ctx context.Context) error {
 }
 
 func (pw *PersistenceWorker) flush(ctx context.Context, events []EventRow, journals []JournalRow) error {
+	start := time.Now()
+
 	// Write events and journals in a single transaction
 	tx, err := pw.writer.db.BeginTx(ctx, nil)
 	if err != nil {
+		if pw.metrics != nil {
+			pw.metrics.PersistErrors.WithLabelValues("tx_begin").Inc()
+		}
 		return err
 	}
 	defer tx.Rollback()
 
 	if err := pw.writer.WriteEventBatch(ctx, events); err != nil {
+		if pw.metrics != nil {
+			pw.metrics.PersistErrors.WithLabelValues("write_events").Inc()
+		}
 		return err
 	}
 
 	if err := pw.writer.WriteJournalBatch(ctx, journals); err != nil {
+		if pw.metrics != nil {
+			pw.metrics.PersistErrors.WithLabelValues("write_journals").Inc()
+		}
 		return err
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		if pw.metrics != nil {
+			pw.metrics.PersistErrors.WithLabelValues("tx_commit").Inc()
+		}
+		return err
+	}
+
+	// Record metrics on success
+	if pw.metrics != nil {
+		pw.metrics.PersistBatchDur.Observe(time.Since(start).Seconds())
+		pw.metrics.PersistBatchSize.Observe(float64(len(events)))
+		pw.metrics.PersistEventsWritten.Add(float64(len(events)))
+		pw.metrics.PersistJournalsWritten.Add(float64(len(journals)))
+		if len(events) > 0 {
+			pw.metrics.PersistLastSequence.Set(float64(events[len(events)-1].Sequence))
+		}
+	}
+
+	return nil
 }
 
 // GetWriter returns the underlying writer for schema creation etc.

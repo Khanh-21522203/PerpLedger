@@ -1,0 +1,104 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Events Applied (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(perp_core_events_applied_total[1m])",
+          "legendFormat": "{{event_type}}"
+        }
+      ]
+    },
+    {
+      "title": "Core Sequence",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "perp_core_sequence", "legendFormat": "sequence" }
+      ]
+    },
+    {
+      "title": "Persist Last Sequence",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "perp_persist_last_sequence", "legendFormat": "persisted" }
+      ]
+    },
+    {
+      "title": "Event Apply Latency (p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(perp_core_event_apply_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99 {{event_type}}"
+        }
+      ]
+    },
+    {
+      "title": "Channel Utilization",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "perp_channel_utilization",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Persist Batch Duration",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(perp_persist_batch_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, rate(perp_persist_batch_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "title": "Duplicates Caught",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "rate(perp_idempotency_duplicates_total[1m])",
+          "legendFormat": "{{tier}} {{event_type}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["perpledger"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "PerpLedger Overview",
+  "uid": "perpledger-overview"
+}

@@ -1,0 +1,14 @@
+# Per doc §19: Docker build context exclusions
+.git
+.github
+.env*
+*.md
+docs/
+deploy/grafana/
+deploy/prometheus/
+bin/
+coverage.out
+coverage.html
+docker-compose*.yml
+.dockerignore
+Dockerfile

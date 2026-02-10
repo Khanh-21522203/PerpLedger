@@ -2,6 +2,7 @@ package server
 
 import (
 	"PerpLedger/internal/ingestion"
+	"PerpLedger/internal/observability"
 	"PerpLedger/internal/persistence"
 	"PerpLedger/internal/projection"
 	"PerpLedger/internal/query"
@@ -30,10 +31,11 @@ import (
 
 // GRPCServer wraps the gRPC server and gRPC-Gateway HTTP mux.
 type GRPCServer struct {
-	grpcServer *grpc.Server
-	httpServer *http.Server
-	grpcAddr   string
-	httpAddr   string
+	grpcServer    *grpc.Server
+	httpServer    *http.Server
+	grpcAddr      string
+	httpAddr      string
+	healthChecker *observability.HealthChecker
 }
 
 // ServerDeps holds all dependencies needed by the gRPC services.
@@ -43,6 +45,7 @@ type ServerDeps struct {
 	IngestService *ingestion.GRPCIngestService
 	SnapshotMgr   *persistence.SnapshotManager
 	StartTime     time.Time
+	HealthChecker *observability.HealthChecker
 }
 
 // NewGRPCServer creates a new gRPC server with all services registered.
@@ -68,9 +71,10 @@ func NewGRPCServer(grpcAddr, httpAddr string, deps *ServerDeps) *GRPCServer {
 	reflection.Register(grpcServer)
 
 	return &GRPCServer{
-		grpcServer: grpcServer,
-		grpcAddr:   grpcAddr,
-		httpAddr:   httpAddr,
+		grpcServer:    grpcServer,
+		grpcAddr:      grpcAddr,
+		httpAddr:      httpAddr,
+		healthChecker: deps.HealthChecker,
 	}
 }
 
@@ -109,13 +113,18 @@ func (s *GRPCServer) StartHTTPGateway(ctx context.Context) error {
 		return fmt.Errorf("register admin gateway: %w", err)
 	}
 
-	// Wrap with health endpoint for HTTP clients
+	// Health endpoints per doc §20 §7
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"ok"}`)
-	})
+	if s.healthChecker != nil {
+		httpMux.HandleFunc("/healthz", s.healthChecker.LivenessHandler)
+		httpMux.HandleFunc("/readyz", s.healthChecker.ReadinessHandler)
+	} else {
+		httpMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"status":"ok"}`)
+		})
+	}
 	httpMux.Handle("/", mux)
 
 	s.httpServer = &http.Server{

@@ -1,0 +1,36 @@
+# Per doc §19: Integration test docker-compose
+# Usage: docker compose -f docker-compose.test.yml up -d
+version: "3.9"
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: perp-postgres-test
+    environment:
+      POSTGRES_USER: perp_test
+      POSTGRES_PASSWORD: perp_test_password
+      POSTGRES_DB: perpledger_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U perp_test -d perpledger_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  nats-test:
+    image: nats:2.10-alpine
+    container_name: perp-nats-test
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      - "4223:4222"
+      - "8223:8222"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10

@@ -4,6 +4,7 @@ import (
 	"PerpLedger/internal/event"
 	"PerpLedger/internal/ledger"
 	fpmath "PerpLedger/internal/math"
+	"PerpLedger/internal/observability"
 	"PerpLedger/internal/state"
 	"fmt"
 	"sort"
@@ -26,6 +27,7 @@ type DeterministicCore struct {
 	riskParamsMgr     *state.RiskParamsManager
 	idempotency       *IdempotencyChecker
 	sequenceValidator *SequenceValidator
+	metrics           *observability.Metrics
 
 	persistChan    chan<- CoreOutput
 	projectionChan chan<- CoreOutput
@@ -41,6 +43,7 @@ func NewDeterministicCore(
 	startSequence int64,
 	persistChan, projectionChan chan<- CoreOutput,
 	dbChecker DBIdempotencyChecker,
+	metrics *observability.Metrics,
 ) *DeterministicCore {
 	balanceTracker := ledger.NewBalanceTracker()
 	validator := ledger.NewInvariantValidator(balanceTracker)
@@ -67,6 +70,7 @@ func NewDeterministicCore(
 		riskParamsMgr:     riskParamsMgr,
 		idempotency:       idempotencyChecker,
 		sequenceValidator: sequenceValidator,
+		metrics:           metrics,
 		persistChan:       persistChan,
 		projectionChan:    projectionChan,
 	}
@@ -74,6 +78,7 @@ func NewDeterministicCore(
 
 // ProcessEvent is the main processing pipeline
 func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
+	start := time.Now()
 	eventType := evt.EventType().String()
 	idempotencyKey := evt.IdempotencyKey()
 
@@ -98,6 +103,9 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 
 	// If duplicate, skip processing
 	if isDuplicate {
+		if c.metrics != nil {
+			c.metrics.CoreEventsRejected.WithLabelValues(eventType, "duplicate").Inc()
+		}
 		return nil
 	}
 
@@ -184,6 +192,13 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 
 	// Step 12: Mark as processed (add to LRU)
 	c.idempotency.MarkProcessed(eventType, idempotencyKey)
+
+	// Record metrics
+	if c.metrics != nil {
+		c.metrics.CoreEventsApplied.WithLabelValues(eventType).Inc()
+		c.metrics.CoreEventDuration.WithLabelValues(eventType).Observe(time.Since(start).Seconds())
+		c.metrics.CoreSequence.Set(float64(c.sequence))
+	}
 
 	return nil
 }

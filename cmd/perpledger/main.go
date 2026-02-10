@@ -4,6 +4,7 @@ import (
 	"PerpLedger/internal/core"
 	"PerpLedger/internal/event"
 	"PerpLedger/internal/ingestion"
+	"PerpLedger/internal/observability"
 	"PerpLedger/internal/persistence"
 	"PerpLedger/internal/projection"
 	"PerpLedger/internal/query"
@@ -12,12 +13,14 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	_ "github.com/lib/pq"
 )
 
@@ -41,9 +44,10 @@ type Config struct {
 	// Snapshot
 	SnapshotInterval int64 // Take snapshot every N events
 
-	// gRPC/HTTP
-	GRPCAddr string
-	HTTPAddr string
+	// gRPC/HTTP/Metrics
+	GRPCAddr    string
+	HTTPAddr    string
+	MetricsAddr string
 
 	// LRU
 	IdempotencyLRUCapacity int
@@ -54,17 +58,18 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		PostgresURL:            envOrDefault("POSTGRES_URL", "postgres://localhost:5432/perpledger?sslmode=disable"),
-		NATSURL:                envOrDefault("NATS_URL", "nats://localhost:4222"),
-		PersistChanSize:        envIntOrDefault("PERSIST_CHAN_SIZE", 8192),
-		ProjectionChanSize:     envIntOrDefault("PROJECTION_CHAN_SIZE", 4096),
-		PersistBatchSize:       envIntOrDefault("PERSIST_BATCH_SIZE", 256),
+		PostgresURL:            envOrDefault("PERP_POSTGRES_DSN", "postgres://perp:perp_dev_password@localhost:5432/perpledger?sslmode=disable"),
+		NATSURL:                envOrDefault("PERP_NATS_URL", "nats://localhost:4222"),
+		PersistChanSize:        envIntOrDefault("PERP_PERSIST_CHAN_SIZE", 8192),
+		ProjectionChanSize:     envIntOrDefault("PERP_PROJECTION_CHAN_SIZE", 4096),
+		PersistBatchSize:       envIntOrDefault("PERP_PERSIST_BATCH_SIZE", 256),
 		PersistFlushTimeout:    50 * time.Millisecond,
-		SnapshotInterval:       int64(envIntOrDefault("SNAPSHOT_INTERVAL", 100_000)),
-		GRPCAddr:               envOrDefault("GRPC_ADDR", ":9090"),
-		HTTPAddr:               envOrDefault("HTTP_ADDR", ":8080"),
-		IdempotencyLRUCapacity: envIntOrDefault("IDEMPOTENCY_LRU_CAPACITY", 1_000_000),
-		MigrationsDir:          envOrDefault("MIGRATIONS_DIR", "migrations"),
+		SnapshotInterval:       int64(envIntOrDefault("PERP_SNAPSHOT_INTERVAL", 100_000)),
+		GRPCAddr:               envOrDefault("PERP_GRPC_ADDR", ":9090"),
+		HTTPAddr:               envOrDefault("PERP_HTTP_ADDR", ":8080"),
+		MetricsAddr:            envOrDefault("PERP_METRICS_ADDR", ":9091"),
+		IdempotencyLRUCapacity: envIntOrDefault("PERP_IDEMPOTENCY_LRU_CAPACITY", 1_000_000),
+		MigrationsDir:          envOrDefault("PERP_MIGRATIONS_DIR", "migrations"),
 	}
 }
 
@@ -139,12 +144,18 @@ func main() {
 	// --- Postgres idempotency checker ---
 	dbChecker := persistence.NewPostgresIdempotencyChecker(db)
 
+	// --- Observability ---
+	// Per doc §18: Prometheus metrics + structured logging
+	metrics := observability.NewMetrics()
+	healthChecker := observability.NewHealthChecker()
+
 	// --- Deterministic Core ---
 	deterministicCore := core.NewDeterministicCore(
 		startSequence,
 		persistCoreChan,
 		projectionCoreChan,
 		dbChecker,
+		metrics,
 	)
 
 	// --- LRU Warming ---
@@ -191,6 +202,7 @@ func main() {
 		IngestService: ingestService,
 		SnapshotMgr:   snapMgr,
 		StartTime:     time.Now(),
+		HealthChecker: healthChecker,
 	})
 
 	// --- Start goroutines ---
@@ -198,13 +210,13 @@ func main() {
 	errChan := make(chan error, 10)
 
 	// 1. Persistence worker
-	persistWorker := persistence.NewPersistenceWorker(db, persistWorkerChan, cfg.PersistBatchSize, cfg.PersistFlushTimeout)
+	persistWorker := persistence.NewPersistenceWorker(db, persistWorkerChan, cfg.PersistBatchSize, cfg.PersistFlushTimeout, metrics)
 	go func() {
 		errChan <- persistWorker.Run(ctx)
 	}()
 
 	// 2. Projection worker
-	projWorker := projection.NewProjectionWorker(db, projectionWorkerChan)
+	projWorker := projection.NewProjectionWorker(db, projectionWorkerChan, metrics)
 	go func() {
 		errChan <- projWorker.Run(ctx)
 	}()
@@ -234,8 +246,31 @@ func main() {
 		errChan <- grpcServer.StartHTTPGateway(ctx)
 	}()
 
-	log.Printf("INFO: PerpLedger ready (sequence=%d, grpc=%s, http=%s)",
-		startSequence, cfg.GRPCAddr, cfg.HTTPAddr)
+	// 8. Prometheus metrics server (per doc §18)
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		metricsServer := &http.Server{
+			Addr:    cfg.MetricsAddr,
+			Handler: metricsMux,
+		}
+		go func() {
+			<-ctx.Done()
+			shutCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+			defer c()
+			metricsServer.Shutdown(shutCtx)
+		}()
+		log.Printf("INFO: Metrics server listening on %s/metrics", cfg.MetricsAddr)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("metrics server: %w", err)
+		}
+	}()
+
+	// Mark service as ready after all goroutines started
+	healthChecker.SetReady(true)
+
+	log.Printf("INFO: PerpLedger ready (sequence=%d, grpc=%s, http=%s, metrics=%s)",
+		startSequence, cfg.GRPCAddr, cfg.HTTPAddr, cfg.MetricsAddr)
 
 	// --- Wait for shutdown signal ---
 	select {

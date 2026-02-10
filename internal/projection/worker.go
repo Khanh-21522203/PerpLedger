@@ -1,10 +1,12 @@
 package projection
 
 import (
+	"PerpLedger/internal/observability"
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 )
 
 // ProjectionOutput mirrors the data needed by projection workers.
@@ -33,12 +35,14 @@ type ProjectionWorker struct {
 	db        *sql.DB
 	inputChan <-chan ProjectionOutput
 	lastSeq   int64
+	metrics   *observability.Metrics
 }
 
-func NewProjectionWorker(db *sql.DB, inputChan <-chan ProjectionOutput) *ProjectionWorker {
+func NewProjectionWorker(db *sql.DB, inputChan <-chan ProjectionOutput, metrics *observability.Metrics) *ProjectionWorker {
 	return &ProjectionWorker{
 		db:        db,
 		inputChan: inputChan,
+		metrics:   metrics,
 	}
 }
 
@@ -66,6 +70,8 @@ func (pw *ProjectionWorker) Run(ctx context.Context) error {
 }
 
 func (pw *ProjectionWorker) processOutput(ctx context.Context, output ProjectionOutput) error {
+	start := time.Now()
+
 	tx, err := pw.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -88,7 +94,15 @@ func (pw *ProjectionWorker) processOutput(ctx context.Context, output Projection
 		return fmt.Errorf("watermark update: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	if pw.metrics != nil {
+		pw.metrics.ProjectionUpdateDur.WithLabelValues("balances").Observe(time.Since(start).Seconds())
+	}
+
+	return nil
 }
 
 func (pw *ProjectionWorker) updateBalanceProjection(ctx context.Context, tx *sql.Tx, j JournalEntry) error {
