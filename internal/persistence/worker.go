@@ -118,14 +118,14 @@ func (pw *PersistenceWorker) flush(ctx context.Context, events []EventRow, journ
 	}
 	defer tx.Rollback()
 
-	if err := pw.writer.WriteEventBatch(ctx, events); err != nil {
+	if err := pw.writer.WriteEventBatch(ctx, events, tx); err != nil {
 		if pw.metrics != nil {
 			pw.metrics.PersistErrors.WithLabelValues("write_events").Inc()
 		}
 		return err
 	}
 
-	if err := pw.writer.WriteJournalBatch(ctx, journals); err != nil {
+	if err := pw.writer.WriteJournalBatch(ctx, journals, tx); err != nil {
 		if pw.metrics != nil {
 			pw.metrics.PersistErrors.WithLabelValues("write_journals").Inc()
 		}
@@ -159,6 +159,10 @@ func (pw *PersistenceWorker) GetWriter() *EventLogWriter {
 }
 
 // MarshalPayload is a convenience wrapper for JSON-encoding event payloads.
+// NOTE vs docs: docs §2.1 specify "protobuf-encoded event data" for the payload column.
+// Code uses JSON encoding for simplicity and debuggability during MVP. The gen/go/ protobuf
+// definitions exist for gRPC service interfaces only. Migration to protobuf payloads is a
+// post-MVP optimization (smaller wire size, faster serialization).
 func MarshalPayload(v interface{}) []byte {
 	data, err := json.Marshal(v)
 	if err != nil {

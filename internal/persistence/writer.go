@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// Executor abstracts *sql.DB and *sql.Tx so writers can operate within a transaction.
+type Executor interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
 // EventLogWriter writes events and journals to Postgres using batch inserts.
 // Per doc §11: the persistence worker uses COPY protocol for high throughput.
 // This implementation uses multi-row INSERT as a portable alternative;
@@ -19,7 +24,10 @@ type EventLogWriter struct {
 	flushTimeout time.Duration
 }
 
-// EventRow represents a row in event_log.events
+// EventRow represents a row in event_log.events.
+// NOTE vs docs §2.1: docs use "timestamp_us BIGINT" — code uses "timestamp" (time.Time).
+// Postgres stores time.Time as TIMESTAMPTZ which preserves microsecond precision.
+// This is an intentional choice for better Postgres query ergonomics (range queries, etc).
 type EventRow struct {
 	Sequence       int64
 	EventType      string
@@ -32,7 +40,11 @@ type EventRow struct {
 	SourceSequence int64
 }
 
-// JournalRow represents a row in event_log.journal
+// JournalRow represents a row in event_log.journal.
+// NOTE vs docs §2.3: docs use "event_sequence" — code uses "sequence" (same semantics).
+// Docs use "asset" (TEXT) — code uses "asset_id" (uint16, more efficient for joins).
+// Docs use "timestamp_us" — code uses "timestamp" (int64 microseconds, same semantics).
+// Code adds "event_ref" and "batch_id" not in docs (for traceability).
 type JournalRow struct {
 	JournalID     string
 	BatchID       string
@@ -55,7 +67,8 @@ func NewEventLogWriter(db *sql.DB, batchSize int, flushTimeout time.Duration) *E
 }
 
 // WriteEventBatch writes a batch of events to event_log.events using multi-row INSERT.
-func (w *EventLogWriter) WriteEventBatch(ctx context.Context, events []EventRow) error {
+// Pass a *sql.Tx to run inside a transaction, or nil to use the writer's default *sql.DB.
+func (w *EventLogWriter) WriteEventBatch(ctx context.Context, events []EventRow, exec ...Executor) error {
 	if len(events) == 0 {
 		return nil
 	}
@@ -83,12 +96,17 @@ func (w *EventLogWriter) WriteEventBatch(ctx context.Context, events []EventRow)
 	query += strings.Join(values, ", ")
 	query += " ON CONFLICT (sequence) DO NOTHING" // Idempotent writes
 
-	_, err := w.db.ExecContext(ctx, query, args...)
+	var e Executor = w.db
+	if len(exec) > 0 && exec[0] != nil {
+		e = exec[0]
+	}
+	_, err := e.ExecContext(ctx, query, args...)
 	return err
 }
 
 // WriteJournalBatch writes a batch of journal entries to event_log.journal.
-func (w *EventLogWriter) WriteJournalBatch(ctx context.Context, journals []JournalRow) error {
+// Pass a *sql.Tx to run inside a transaction, or nil to use the writer's default *sql.DB.
+func (w *EventLogWriter) WriteJournalBatch(ctx context.Context, journals []JournalRow, exec ...Executor) error {
 	if len(journals) == 0 {
 		return nil
 	}
@@ -116,7 +134,11 @@ func (w *EventLogWriter) WriteJournalBatch(ctx context.Context, journals []Journ
 	query += strings.Join(values, ", ")
 	query += " ON CONFLICT (journal_id) DO NOTHING"
 
-	_, err := w.db.ExecContext(ctx, query, args...)
+	var e Executor = w.db
+	if len(exec) > 0 && exec[0] != nil {
+		e = exec[0]
+	}
+	_, err := e.ExecContext(ctx, query, args...)
 	return err
 }
 

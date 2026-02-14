@@ -130,14 +130,19 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 	outputs := make([]CoreOutput, 0, len(batches))
 
 	for _, batch := range batches {
-		// Validate batch balance
-		if err := c.validator.ValidateBatchBalance(batch); err != nil {
-			panic(fmt.Sprintf("FATAL: unbalanced batch: %v", err))
-		}
+		// Skip validation and application for empty batches (state-only events
+		// like MarkPriceUpdate, FundingRateSnapshot, RiskParamUpdate produce
+		// no journals but still need an envelope in the event log).
+		if len(batch.Journals) > 0 {
+			// Validate batch balance
+			if err := c.validator.ValidateBatchBalance(batch); err != nil {
+				panic(fmt.Sprintf("FATAL: unbalanced batch: %v", err))
+			}
 
-		// Apply batch to balances
-		if err := c.balanceTracker.ApplyBatch(batch); err != nil {
-			return fmt.Errorf("apply batch failed: %w", err)
+			// Apply batch to balances
+			if err := c.balanceTracker.ApplyBatch(batch); err != nil {
+				return fmt.Errorf("apply batch failed: %w", err)
+			}
 		}
 
 		// Compute state digest
@@ -211,11 +216,11 @@ func (c *DeterministicCore) getPartition(evt event.Event) string {
 	return "global"
 }
 
-// getEventTimestamp extracts versioned timestamp from event
+// getEventTimestamp extracts versioned timestamp from event.
+// Per doc §3.3: the core MUST NOT call time.Now(). All timestamps are versioned inputs.
 func (c *DeterministicCore) getEventTimestamp(evt event.Event) time.Time {
-	// Extract timestamp based on event type
 	switch e := evt.(type) {
-	case *event.TradeFill:
+	case *event.DepositInitiated:
 		return e.Timestamp
 	case *event.DepositConfirmed:
 		return e.Timestamp
@@ -225,19 +230,26 @@ func (c *DeterministicCore) getEventTimestamp(evt event.Event) time.Time {
 		return e.Timestamp
 	case *event.WithdrawalRejected:
 		return e.Timestamp
+	case *event.TradeFill:
+		return e.Timestamp
 	case *event.MarkPriceUpdate:
 		return time.UnixMicro(e.PriceTimestamp)
 	case *event.FundingRateSnapshot:
 		return time.UnixMicro(e.EpochTs)
 	case *event.FundingEpochSettle:
-		// Get timestamp from stored snapshot
-		if snapshot, ok := c.fundingManager.GetFundingSnapshot(e.Market, e.EpochID); ok {
-			return time.UnixMicro(snapshot.Timestamp)
+		snapshot, ok := c.fundingManager.GetFundingSnapshot(e.Market, e.EpochID)
+		if !ok {
+			panic(fmt.Sprintf("FATAL: no funding snapshot for %s epoch %d — cannot derive deterministic timestamp", e.Market, e.EpochID))
 		}
-		return time.Now() // Fallback (should not happen)
+		return time.UnixMicro(snapshot.Timestamp)
+	case *event.LiquidationFill:
+		return time.UnixMicro(e.Timestamp)
+	case *event.LiquidationCompleted:
+		return time.UnixMicro(e.Timestamp)
+	case *event.RiskParamUpdate:
+		return time.UnixMicro(e.Timestamp)
 	default:
-		// Unknown event type - use current time (should not happen)
-		return time.Now()
+		panic(fmt.Sprintf("FATAL: getEventTimestamp called with unhandled event type %T — deterministic core cannot use wall-clock time", evt))
 	}
 }
 
@@ -512,7 +524,9 @@ func (c *DeterministicCore) checkMarginForMarket(marketID string) {
 	}
 }
 
-// triggerLiquidation creates liquidation event
+// triggerLiquidation creates a LiquidationTriggered event and emits it.
+// Per docs §6.2: published to NATS "liquidations.triggered" for the external
+// liquidation engine to begin unwinding the position.
 func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string) {
 	liquidationID, err := c.liquidationMgr.TriggerLiquidation(userID, marketID, c.sequence)
 	if err != nil {
@@ -520,9 +534,30 @@ func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string
 		return
 	}
 
-	// TODO: Emit LiquidationTriggered event to output channel
-	// This will be published to NATS for liquidation engine to consume
-	_ = liquidationID
+	triggerEvt := &event.LiquidationTriggered{
+		LiquidationID: liquidationID,
+		UserID:        userID,
+		Market:        marketID,
+		Sequence:      c.sequence,
+		Timestamp:     time.Now().UnixMicro(), // Side-effect event — not replayed, only published outbound
+	}
+
+	// Emit to persist channel so it's recorded in the event log
+	output := CoreOutput{
+		Envelope: &event.EventEnvelope{
+			Sequence:       c.sequence,
+			IdempotencyKey: triggerEvt.IdempotencyKey(),
+			EventType:      event.EventTypeLiquidationTriggered,
+			MarketID:       triggerEvt.MarketID(),
+		},
+	}
+
+	// Non-blocking send — if channel is full, log warning but don't block the core
+	select {
+	case c.persistChan <- output:
+	default:
+		// Channel full — this is a backpressure signal
+	}
 }
 
 // handleLiquidationFill processes a liquidation fill from the liquidation engine.
@@ -797,6 +832,34 @@ func (c *DeterministicCore) handleLiquidationCompleted(evt *event.LiquidationCom
 	}, nil
 }
 
+// handleRiskParamUpdate processes a risk parameter update for a market.
+// Per docs §8: update in-memory risk params, recompute margin for all positions
+// in the market, trigger liquidation for any user whose margin now violates MM.
+// No journal entries are generated — this only mutates in-memory state.
+func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*ledger.Batch, error) {
+	c.riskParamsMgr.UpdateRiskParams(&state.RiskParams{
+		MarketID:     evt.Market,
+		IMFraction:   evt.IMFraction,
+		MMFraction:   evt.MMFraction,
+		MaxLeverage:  evt.MaxLeverage,
+		TickSize:     evt.TickSize,
+		LotSize:      evt.LotSize,
+		EffectiveSeq: evt.EffectiveSeq,
+	})
+
+	// Recompute margin for all positions in this market
+	c.checkMarginForMarket(evt.Market)
+
+	// Return empty batch (risk param updates don't generate journals)
+	return &ledger.Batch{
+		BatchID:   uuid.New(),
+		EventRef:  evt.IdempotencyKey(),
+		Sequence:  c.sequence,
+		Timestamp: evt.Timestamp,
+		Journals:  []ledger.Journal{},
+	}, nil
+}
+
 func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error) {
 	switch e := evt.(type) {
 	case *event.DepositInitiated:
@@ -819,6 +882,8 @@ func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error
 		return c.handleLiquidationFill(e)
 	case *event.LiquidationCompleted:
 		return c.handleLiquidationCompleted(e)
+	case *event.RiskParamUpdate:
+		return c.handleRiskParamUpdate(e)
 	default:
 		return nil, fmt.Errorf("unknown event type: %T", evt)
 	}

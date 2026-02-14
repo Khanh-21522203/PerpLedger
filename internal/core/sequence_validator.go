@@ -2,13 +2,12 @@ package core
 
 import (
 	"fmt"
-	"sync"
 )
 
-// SequenceValidator validates source sequences per partition
+// SequenceValidator validates source sequences per partition.
+// Not thread-safe — only accessed from the single-threaded deterministic core.
 type SequenceValidator struct {
 	expectedNextSeq map[string]int64 // partition -> next expected sequence
-	mu              sync.RWMutex
 	metrics         *SequenceMetrics
 }
 
@@ -26,9 +25,6 @@ func (sv *SequenceValidator) ValidateSequence(
 	idempotencyKey string,
 	isDuplicate bool,
 ) error {
-	sv.mu.Lock()
-	defer sv.mu.Unlock()
-
 	expected := sv.expectedNextSeq[partition]
 
 	if sourceSequence < expected {
@@ -62,9 +58,6 @@ func (sv *SequenceValidator) ValidatePriceSequence(
 ) error {
 	partition := fmt.Sprintf("price:%s", marketID)
 
-	sv.mu.Lock()
-	defer sv.mu.Unlock()
-
 	expected := sv.expectedNextSeq[partition]
 
 	if priceSequence <= expected {
@@ -86,25 +79,22 @@ func (sv *SequenceValidator) ValidatePriceSequence(
 
 // GetExpectedSequence returns next expected sequence for a partition
 func (sv *SequenceValidator) GetExpectedSequence(partition string) int64 {
-	sv.mu.RLock()
-	defer sv.mu.RUnlock()
 	return sv.expectedNextSeq[partition]
 }
 
 // SetExpectedSequence initializes expected sequence (used during recovery)
 func (sv *SequenceValidator) SetExpectedSequence(partition string, seq int64) {
-	sv.mu.Lock()
-	defer sv.mu.Unlock()
 	sv.expectedNextSeq[partition] = seq
 }
 
 // --- Metrics ---
 
+// SequenceMetrics tracks sequence validation stats.
+// Not thread-safe — only accessed from the single-threaded deterministic core.
 type SequenceMetrics struct {
 	gaps       map[string]int64 // partition -> gap count
 	outOfOrder map[string]int64 // partition -> out-of-order count
 	priceGaps  map[string]int64 // market_id -> price gap count
-	mu         sync.RWMutex
 }
 
 func NewSequenceMetrics() *SequenceMetrics {
@@ -116,37 +106,25 @@ func NewSequenceMetrics() *SequenceMetrics {
 }
 
 func (m *SequenceMetrics) RecordGap(partition string, expected, got int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.gaps[partition]++
 }
 
 func (m *SequenceMetrics) RecordOutOfOrder(partition string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.outOfOrder[partition]++
 }
 
 func (m *SequenceMetrics) RecordPriceGap(marketID string, expected, got int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.priceGaps[marketID]++
 }
 
 func (m *SequenceMetrics) GetGaps(partition string) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.gaps[partition]
 }
 
 func (m *SequenceMetrics) GetOutOfOrder(partition string) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.outOfOrder[partition]
 }
 
 func (m *SequenceMetrics) GetPriceGaps(marketID string) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.priceGaps[marketID]
 }

@@ -24,7 +24,7 @@ func (pic *PostgresIdempotencyChecker) IsDuplicate(eventType string, idempotency
 
 	query := `
         SELECT 1 
-        FROM events 
+        FROM event_log.events 
         WHERE event_type = $1 AND idempotency_key = $2 
         LIMIT 1
     `

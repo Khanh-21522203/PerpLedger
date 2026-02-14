@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	adminv1 "PerpLedger/gen/go/perpledger/admin/v1"
+	eventsv1 "PerpLedger/gen/go/perpledger/events/v1"
 	ingestv1 "PerpLedger/gen/go/perpledger/ingest/v1"
 	queryv1 "PerpLedger/gen/go/perpledger/query/v1"
 )
@@ -464,11 +465,60 @@ func (s *ingestServiceImpl) SubmitEvent(ctx context.Context, req *ingestv1.Submi
 		return nil, status.Error(codes.InvalidArgument, "envelope is required")
 	}
 
-	// TODO: parse envelope.payload into typed event and inject via svc
-	// For now, return accepted
-	return &ingestv1.SubmitEventResponse{
-		Accepted: true,
-	}, nil
+	// Map protobuf EventType enum to string event type name for the parser
+	eventTypeName := protoEventTypeToString(req.Envelope.EventType)
+	if eventTypeName == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "unknown event_type: %d", req.Envelope.EventType)
+	}
+
+	raw := ingestion.RawEvent{
+		Subject: eventTypeName,
+		Data:    req.Envelope.Payload,
+	}
+
+	evt, err := ingestion.ParseRawEvent(raw, eventTypeName)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "parse payload: %v", err)
+	}
+
+	// Inject into the event channel (same path as GRPCIngestService)
+	select {
+	case s.svc.EventChan() <- evt:
+		return &ingestv1.SubmitEventResponse{Accepted: true}, nil
+	case <-ctx.Done():
+		return nil, status.Error(codes.DeadlineExceeded, "context cancelled")
+	}
+}
+
+func protoEventTypeToString(et eventsv1.EventType) string {
+	switch et {
+	case eventsv1.EventType_TRADE_FILL:
+		return "TradeFill"
+	case eventsv1.EventType_DEPOSIT_INITIATED:
+		return "DepositInitiated"
+	case eventsv1.EventType_DEPOSIT_CONFIRMED:
+		return "DepositConfirmed"
+	case eventsv1.EventType_WITHDRAWAL_REQUESTED:
+		return "WithdrawalRequested"
+	case eventsv1.EventType_WITHDRAWAL_CONFIRMED:
+		return "WithdrawalConfirmed"
+	case eventsv1.EventType_WITHDRAWAL_REJECTED:
+		return "WithdrawalRejected"
+	case eventsv1.EventType_MARK_PRICE_UPDATE:
+		return "MarkPriceUpdate"
+	case eventsv1.EventType_FUNDING_RATE_SNAPSHOT:
+		return "FundingRateSnapshot"
+	case eventsv1.EventType_FUNDING_EPOCH_SETTLE:
+		return "FundingEpochSettle"
+	case eventsv1.EventType_RISK_PARAM_UPDATE:
+		return "RiskParamUpdate"
+	case eventsv1.EventType_LIQUIDATION_FILL:
+		return "LiquidationFill"
+	case eventsv1.EventType_LIQUIDATION_COMPLETED:
+		return "LiquidationCompleted"
+	default:
+		return ""
+	}
 }
 
 func (s *ingestServiceImpl) UpdateRiskParams(ctx context.Context, req *ingestv1.UpdateRiskParamsRequest) (*ingestv1.UpdateRiskParamsResponse, error) {

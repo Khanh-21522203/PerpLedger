@@ -51,18 +51,18 @@ type Batch struct {
 	Journals  []Journal
 }
 
-// Validate ensures the batch is balanced
+// Validate ensures the batch is well-formed.
+// Note on balance invariant: each journal entry is a balanced transfer by construction
+// (a single positive amount moves from credit account to debit account). Therefore
+// Σ debits == Σ credits is guaranteed per-entry. Multi-leg batches (e.g., trade with fee)
+// use multiple entries under one batch_id — each individually balanced.
 func (b *Batch) Validate() error {
 	if len(b.Journals) == 0 {
 		return fmt.Errorf("batch %s is empty", b.BatchID)
 	}
 
-	// Sum debits and credits per asset
-	debitSums := make(map[AssetID]int64)
-	creditSums := make(map[AssetID]int64)
-
 	for _, j := range b.Journals {
-		// Validate amount is positive
+		// Validate amount is positive (L-02)
 		if j.Amount <= 0 {
 			return fmt.Errorf("journal %s has non-positive amount: %d", j.JournalID, j.Amount)
 		}
@@ -72,18 +72,9 @@ func (b *Batch) Validate() error {
 			return fmt.Errorf("journal %s has mismatched batch_id", j.JournalID)
 		}
 
-		// Accumulate sums
-		debitSums[j.AssetID] += j.Amount
-		creditSums[j.AssetID] += j.Amount
-	}
-
-	// Verify balance per asset
-	for assetID, debitSum := range debitSums {
-		creditSum := creditSums[assetID]
-		if debitSum != creditSum {
-			assetName, _ := GetAssetName(assetID)
-			return fmt.Errorf("batch %s unbalanced for %s: debits=%d credits=%d",
-				b.BatchID, assetName, debitSum, creditSum)
+		// Validate debit != credit (no self-transfers)
+		if j.DebitAccount == j.CreditAccount {
+			return fmt.Errorf("journal %s has same debit and credit account", j.JournalID)
 		}
 	}
 

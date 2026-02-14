@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // SnapshotManager handles creating and loading state snapshots for recovery.
@@ -78,11 +80,16 @@ func (sm *SnapshotManager) SaveSnapshot(ctx context.Context, snap *SnapshotData)
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 
+	snapshotID := uuid.New()
+	sizeBytes := len(data)
+	formatVersion := int32(1) // v1: JSON-encoded SnapshotData
+
 	_, err = sm.db.ExecContext(ctx, `
-		INSERT INTO event_log.snapshots (sequence, data, state_hash, created_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (sequence) DO UPDATE SET data = $2, state_hash = $3
-	`, snap.Sequence, data, snap.StateHash, snap.CreatedAt)
+		INSERT INTO event_log.snapshots 
+			(snapshot_id, sequence, data, state_hash, format_version, size_bytes, verified, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)
+		ON CONFLICT (sequence) DO UPDATE SET data = $3, state_hash = $4, size_bytes = $6
+	`, snapshotID, snap.Sequence, data, snap.StateHash, formatVersion, sizeBytes, snap.CreatedAt)
 
 	return err
 }

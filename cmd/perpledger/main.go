@@ -60,10 +60,10 @@ func DefaultConfig() Config {
 	return Config{
 		PostgresURL:            envOrDefault("PERP_POSTGRES_DSN", "postgres://perp:perp_dev_password@localhost:5432/perpledger?sslmode=disable"),
 		NATSURL:                envOrDefault("PERP_NATS_URL", "nats://localhost:4222"),
-		PersistChanSize:        envIntOrDefault("PERP_PERSIST_CHAN_SIZE", 8192),
-		ProjectionChanSize:     envIntOrDefault("PERP_PROJECTION_CHAN_SIZE", 4096),
-		PersistBatchSize:       envIntOrDefault("PERP_PERSIST_BATCH_SIZE", 256),
-		PersistFlushTimeout:    50 * time.Millisecond,
+		PersistChanSize:        envIntOrDefault("PERP_PERSIST_CHAN_SIZE", 1024),      // Per doc §3: persist channel capacity
+		ProjectionChanSize:     envIntOrDefault("PERP_PROJECTION_CHAN_SIZE", 2048),    // Per doc §3: projection channel capacity
+		PersistBatchSize:       envIntOrDefault("PERP_PERSIST_BATCH_SIZE", 50),       // Per doc §4.3: batch size
+		PersistFlushTimeout:    10 * time.Millisecond,                                 // Per doc §4.3: batch timeout
 		SnapshotInterval:       int64(envIntOrDefault("PERP_SNAPSHOT_INTERVAL", 100_000)),
 		GRPCAddr:               envOrDefault("PERP_GRPC_ADDR", ":9090"),
 		HTTPAddr:               envOrDefault("PERP_HTTP_ADDR", ":8080"),
@@ -424,6 +424,18 @@ func bridgeCoreOutputs(
 // Per doc §15: the shell validates, parses, and converts raw events before
 // sending to the deterministic core.
 func runIngestionLoop(ctx context.Context, rawChan <-chan ingestion.RawEvent, core *core.DeterministicCore) {
+	// Build subject-prefix → event-type lookup from DefaultSubjects.
+	// Subjects use ">" wildcard, so we match by prefix (strip trailing ".>").
+	subjectToType := make(map[string]string)
+	for _, cfg := range ingestion.DefaultSubjects() {
+		prefix := cfg.Subject
+		// Strip trailing ".>" for prefix matching
+		if len(prefix) > 2 && prefix[len(prefix)-2:] == ".>" {
+			prefix = prefix[:len(prefix)-2]
+		}
+		subjectToType[prefix] = cfg.EventType
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -433,17 +445,47 @@ func runIngestionLoop(ctx context.Context, rawChan <-chan ingestion.RawEvent, co
 				return
 			}
 
-			// TODO: Parse raw.Data into typed event.Event based on raw.Subject
-			// For now, ACK and skip — full parsing requires protobuf definitions
-			_ = raw
-			_ = core
-			// Example:
-			// evt, err := parseEvent(raw)
-			// if err != nil { raw.NakFunc(); continue }
-			// if err := core.ProcessEvent(evt); err != nil { log.Printf(...) }
-			// raw.AckFunc()
+			// Resolve event type from NATS subject by matching longest prefix
+			eventType := resolveEventType(raw.Subject, subjectToType)
+			if eventType == "" {
+				log.Printf("WARN: unknown NATS subject: %s", raw.Subject)
+				raw.NakFunc()
+				continue
+			}
+
+			evt, err := ingestion.ParseRawEvent(raw, eventType)
+			if err != nil {
+				log.Printf("WARN: parse event failed (subject=%s): %v", raw.Subject, err)
+				raw.NakFunc()
+				continue
+			}
+
+			if err := core.ProcessEvent(evt); err != nil {
+				log.Printf("ERROR: core.ProcessEvent failed (type=%s, key=%s): %v",
+					evt.EventType(), evt.IdempotencyKey(), err)
+				// NAK so NATS redelivers (up to MaxDeliver)
+				raw.NakFunc()
+				continue
+			}
+
+			raw.AckFunc()
 		}
 	}
+}
+
+// resolveEventType finds the event type for a NATS subject by matching the longest prefix.
+func resolveEventType(subject string, prefixMap map[string]string) string {
+	bestMatch := ""
+	bestType := ""
+	for prefix, evtType := range prefixMap {
+		if len(subject) >= len(prefix) && subject[:len(prefix)] == prefix {
+			if len(prefix) > len(bestMatch) {
+				bestMatch = prefix
+				bestType = evtType
+			}
+		}
+	}
+	return bestType
 }
 
 // --- Helpers ---

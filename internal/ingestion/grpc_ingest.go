@@ -20,12 +20,19 @@ func NewGRPCIngestService(eventChan chan<- event.Event) *GRPCIngestService {
 	return &GRPCIngestService{eventChan: eventChan}
 }
 
+// EventChan returns the event channel for external injection (e.g., gRPC SubmitEvent).
+func (s *GRPCIngestService) EventChan() chan<- event.Event {
+	return s.eventChan
+}
+
 // InjectDeposit manually injects a DepositConfirmed event.
+// Per docs §3.3: all timestamps must be versioned inputs, not wall-clock.
 func (s *GRPCIngestService) InjectDeposit(
 	ctx context.Context,
 	userID uuid.UUID,
 	asset string,
 	amount int64,
+	timestamp time.Time,
 ) error {
 	if amount <= 0 {
 		return fmt.Errorf("amount must be positive")
@@ -36,8 +43,8 @@ func (s *GRPCIngestService) InjectDeposit(
 		UserID:    userID,
 		Asset:     asset,
 		Amount:    amount,
-		Sequence:  time.Now().UnixMicro(), // Admin-injected: use timestamp as sequence
-		Timestamp: time.Now(),
+		Sequence:  timestamp.UnixMicro(),
+		Timestamp: timestamp,
 	}
 
 	select {
@@ -54,6 +61,7 @@ func (s *GRPCIngestService) InjectWithdrawal(
 	userID uuid.UUID,
 	asset string,
 	amount int64,
+	timestamp time.Time,
 ) error {
 	if amount <= 0 {
 		return fmt.Errorf("amount must be positive")
@@ -64,8 +72,8 @@ func (s *GRPCIngestService) InjectWithdrawal(
 		UserID:       userID,
 		Asset:        asset,
 		Amount:       amount,
-		Sequence:     time.Now().UnixMicro(),
-		Timestamp:    time.Now(),
+		Sequence:     timestamp.UnixMicro(),
+		Timestamp:    timestamp,
 	}
 
 	select {
@@ -82,6 +90,7 @@ func (s *GRPCIngestService) InjectMarkPrice(
 	marketID string,
 	markPrice int64,
 	priceSequence int64,
+	timestampUs int64,
 ) error {
 	if markPrice <= 0 {
 		return fmt.Errorf("mark price must be positive")
@@ -91,7 +100,7 @@ func (s *GRPCIngestService) InjectMarkPrice(
 		Market:         marketID,
 		MarkPrice:      markPrice,
 		PriceSequence:  priceSequence,
-		PriceTimestamp: time.Now().UnixMicro(),
+		PriceTimestamp: timestampUs,
 		IndexPrice:     markPrice, // Default: same as mark price
 	}
 
@@ -110,13 +119,14 @@ func (s *GRPCIngestService) InjectFundingSnapshot(
 	epochID int64,
 	fundingRate int64,
 	markPrice int64,
+	epochTimestampUs int64,
 ) error {
 	evt := &event.FundingRateSnapshot{
 		Market:      marketID,
 		FundingRate: fundingRate,
 		EpochID:     epochID,
 		MarkPrice:   markPrice,
-		EpochTs:     time.Now().UnixMicro(),
+		EpochTs:     epochTimestampUs,
 	}
 
 	select {

@@ -3,7 +3,6 @@ package core
 import (
 	"container/list"
 	"fmt"
-	"sync"
 )
 
 // IdempotencyChecker implements two-tier deduplication
@@ -75,12 +74,12 @@ func (ic *IdempotencyChecker) GetMetrics() *IdempotencyMetrics {
 
 // --- LRU Implementation ---
 
-// IdempotencyLRU is a thread-safe LRU cache for idempotency keys
+// IdempotencyLRU is an LRU cache for idempotency keys.
+// Not thread-safe — only accessed from the single-threaded deterministic core.
 type IdempotencyLRU struct {
 	capacity int
 	cache    map[string]*list.Element
 	lruList  *list.List
-	mu       sync.RWMutex
 
 	evictions int64 // For metrics
 }
@@ -99,9 +98,6 @@ func NewIdempotencyLRU(capacity int) *IdempotencyLRU {
 
 // Contains checks if key exists (promotes to front)
 func (lru *IdempotencyLRU) Contains(key string) bool {
-	lru.mu.Lock()
-	defer lru.mu.Unlock()
-
 	elem, exists := lru.cache[key]
 	if exists {
 		// Move to front (most recently used)
@@ -113,9 +109,6 @@ func (lru *IdempotencyLRU) Contains(key string) bool {
 
 // Add inserts a key (or promotes if exists)
 func (lru *IdempotencyLRU) Add(key string) {
-	lru.mu.Lock()
-	defer lru.mu.Unlock()
-
 	// Check if already exists
 	if elem, exists := lru.cache[key]; exists {
 		lru.lruList.MoveToFront(elem)
@@ -147,9 +140,6 @@ func (lru *IdempotencyLRU) evictOldest() {
 // Per doc §10: on restart, load recent idempotency keys from Postgres
 // into the LRU to avoid cold-path DB lookups for recently processed events.
 func (lru *IdempotencyLRU) WarmFromKeys(keys []string) {
-	lru.mu.Lock()
-	defer lru.mu.Unlock()
-
 	for _, key := range keys {
 		if _, exists := lru.cache[key]; exists {
 			continue
@@ -166,25 +156,22 @@ func (lru *IdempotencyLRU) WarmFromKeys(keys []string) {
 
 // Size returns current number of entries
 func (lru *IdempotencyLRU) Size() int {
-	lru.mu.RLock()
-	defer lru.mu.RUnlock()
 	return lru.lruList.Len()
 }
 
 // Evictions returns total evictions (for metrics)
 func (lru *IdempotencyLRU) Evictions() int64 {
-	lru.mu.RLock()
-	defer lru.mu.RUnlock()
 	return lru.evictions
 }
 
 // --- Metrics ---
 
+// IdempotencyMetrics tracks dedup stats.
+// Not thread-safe — only accessed from the single-threaded deterministic core.
 type IdempotencyMetrics struct {
 	duplicatesLRU      map[string]int64 // event_type -> count
 	duplicatesPostgres map[string]int64
 	tier2Errors        int64
-	mu                 sync.RWMutex
 }
 
 func NewIdempotencyMetrics() *IdempotencyMetrics {
@@ -195,9 +182,6 @@ func NewIdempotencyMetrics() *IdempotencyMetrics {
 }
 
 func (m *IdempotencyMetrics) RecordDuplicate(eventType string, tier string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if tier == "lru" {
 		m.duplicatesLRU[eventType]++
 	} else {
@@ -206,19 +190,13 @@ func (m *IdempotencyMetrics) RecordDuplicate(eventType string, tier string) {
 }
 
 func (m *IdempotencyMetrics) RecordTier2Error() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.tier2Errors++
 }
 
 func (m *IdempotencyMetrics) GetDuplicates(eventType string) (lru int64, postgres int64) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.duplicatesLRU[eventType], m.duplicatesPostgres[eventType]
 }
 
 func (m *IdempotencyMetrics) GetTier2Errors() int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.tier2Errors
 }

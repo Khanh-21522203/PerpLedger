@@ -2,7 +2,6 @@ package ingestion
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -44,12 +43,17 @@ type SubjectConfig struct {
 func DefaultSubjects() []SubjectConfig {
 	return []SubjectConfig{
 		{Subject: "perp.trades.>", EventType: "TradeFill", ConsumerName: "ledger-trades", StreamName: "PERP_TRADES"},
-		{Subject: "perp.deposits.>", EventType: "DepositConfirmed", ConsumerName: "ledger-deposits", StreamName: "PERP_DEPOSITS"},
-		{Subject: "perp.withdrawals.>", EventType: "WithdrawalRequested", ConsumerName: "ledger-withdrawals", StreamName: "PERP_WITHDRAWALS"},
+		{Subject: "perp.deposits.initiated.>", EventType: "DepositInitiated", ConsumerName: "ledger-deposit-init", StreamName: "PERP_DEPOSITS"},
+		{Subject: "perp.deposits.confirmed.>", EventType: "DepositConfirmed", ConsumerName: "ledger-deposit-confirm", StreamName: "PERP_DEPOSITS"},
+		{Subject: "perp.withdrawals.requested.>", EventType: "WithdrawalRequested", ConsumerName: "ledger-wd-request", StreamName: "PERP_WITHDRAWALS"},
+		{Subject: "perp.withdrawals.confirmed.>", EventType: "WithdrawalConfirmed", ConsumerName: "ledger-wd-confirm", StreamName: "PERP_WITHDRAWALS"},
+		{Subject: "perp.withdrawals.rejected.>", EventType: "WithdrawalRejected", ConsumerName: "ledger-wd-reject", StreamName: "PERP_WITHDRAWALS"},
 		{Subject: "perp.prices.>", EventType: "MarkPriceUpdate", ConsumerName: "ledger-prices", StreamName: "PERP_PRICES"},
 		{Subject: "perp.funding.snapshot.>", EventType: "FundingRateSnapshot", ConsumerName: "ledger-funding-snap", StreamName: "PERP_FUNDING"},
 		{Subject: "perp.funding.settle.>", EventType: "FundingEpochSettle", ConsumerName: "ledger-funding-settle", StreamName: "PERP_FUNDING"},
 		{Subject: "perp.liquidation.fill.>", EventType: "LiquidationFill", ConsumerName: "ledger-liq-fill", StreamName: "PERP_LIQUIDATION"},
+		{Subject: "perp.liquidation.completed.>", EventType: "LiquidationCompleted", ConsumerName: "ledger-liq-complete", StreamName: "PERP_LIQUIDATION"},
+		{Subject: "perp.risk.params.>", EventType: "RiskParamUpdate", ConsumerName: "ledger-risk-params", StreamName: "PERP_RISK"},
 	}
 }
 
@@ -200,11 +204,3 @@ func ConnectNATS(url string) (*nats.Conn, jetstream.JetStream, error) {
 	return nc, js, nil
 }
 
-// ParseRawEvent converts a RawEvent into a JSON map for further type-specific parsing.
-func ParseRawEvent(raw RawEvent) (map[string]json.RawMessage, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw.Data, &fields); err != nil {
-		return nil, fmt.Errorf("parse event: %w", err)
-	}
-	return fields, nil
-}

@@ -17,6 +17,32 @@ type ProjectionOutput struct {
 	MarketID       *string
 	JournalEntries []JournalEntry
 	Timestamp      int64
+
+	// Position projection fields (populated for TradeFill, LiquidationFill)
+	UserID        *string
+	Side          int32
+	Size          int64
+	AvgEntryPrice int64
+	RealizedPnL   int64
+
+	// Funding projection fields (populated for FundingEpochSettle)
+	FundingPayments []FundingPaymentProjection
+
+	// Liquidation projection fields (populated for LiquidationTriggered, LiquidationCompleted)
+	LiquidationID     *string
+	LiquidationStatus string
+	Deficit           int64
+}
+
+// FundingPaymentProjection represents a single user's funding payment for projection.
+type FundingPaymentProjection struct {
+	UserID       string
+	MarketID     string
+	EpochID      int64
+	FundingRate  int64
+	PositionSize int64
+	MarkPrice    int64
+	Payment      int64
 }
 
 // JournalEntry is a simplified journal for projection consumption.
@@ -85,6 +111,22 @@ func (pw *ProjectionWorker) processOutput(ctx context.Context, output Projection
 		}
 	}
 
+	// Update position projections for trade/liquidation events
+	switch output.EventType {
+	case "TradeFill", "LiquidationFill":
+		if err := pw.updatePositionProjection(ctx, tx, output); err != nil {
+			return fmt.Errorf("position projection: %w", err)
+		}
+	case "FundingEpochSettle":
+		if err := pw.updateFundingHistoryProjection(ctx, tx, output); err != nil {
+			return fmt.Errorf("funding history projection: %w", err)
+		}
+	case "LiquidationTriggered", "LiquidationCompleted":
+		if err := pw.updateLiquidationProjection(ctx, tx, output); err != nil {
+			return fmt.Errorf("liquidation projection: %w", err)
+		}
+	}
+
 	// Update projection watermark
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO projections.watermark (worker_id, last_sequence, updated_at)
@@ -105,6 +147,70 @@ func (pw *ProjectionWorker) processOutput(ctx context.Context, output Projection
 	return nil
 }
 
+// updatePositionProjection upserts position state from trade/liquidation fill events.
+func (pw *ProjectionWorker) updatePositionProjection(ctx context.Context, tx *sql.Tx, output ProjectionOutput) error {
+	if output.UserID == nil || output.MarketID == nil {
+		return nil
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO projections.positions 
+			(user_id, market_id, side, size, avg_entry_price, realized_pnl, updated_seq)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (user_id, market_id) DO UPDATE SET
+			side = EXCLUDED.side,
+			size = EXCLUDED.size,
+			avg_entry_price = EXCLUDED.avg_entry_price,
+			realized_pnl = EXCLUDED.realized_pnl,
+			updated_seq = EXCLUDED.updated_seq
+	`, output.UserID, output.MarketID, output.Side, output.Size,
+		output.AvgEntryPrice, output.RealizedPnL, output.Sequence)
+	return err
+}
+
+// updateFundingHistoryProjection inserts funding payment records.
+func (pw *ProjectionWorker) updateFundingHistoryProjection(ctx context.Context, tx *sql.Tx, output ProjectionOutput) error {
+	for _, fp := range output.FundingPayments {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO projections.funding_history 
+				(user_id, market_id, epoch_id, funding_rate, position_size, mark_price, payment, sequence, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::double precision / 1000000))
+			ON CONFLICT DO NOTHING
+		`, fp.UserID, fp.MarketID, fp.EpochID, fp.FundingRate,
+			fp.PositionSize, fp.MarkPrice, fp.Payment, output.Sequence, output.Timestamp)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateLiquidationProjection tracks liquidation lifecycle events.
+func (pw *ProjectionWorker) updateLiquidationProjection(ctx context.Context, tx *sql.Tx, output ProjectionOutput) error {
+	if output.LiquidationID == nil {
+		return nil
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO projections.liquidation_history 
+			(liquidation_id, user_id, market_id, status, deficit, sequence, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::double precision / 1000000))
+		ON CONFLICT (liquidation_id) DO UPDATE SET
+			status = EXCLUDED.status,
+			deficit = EXCLUDED.deficit,
+			sequence = EXCLUDED.sequence
+	`, output.LiquidationID, output.UserID, output.MarketID,
+		output.LiquidationStatus, output.Deficit, output.Sequence, output.Timestamp)
+	return err
+}
+
+// updateBalanceProjection updates the projections.balances table.
+// NOTE: Docs §3.2 define schema as (user_id, asset, collateral, reserved, ...).
+// Code uses (account_path, asset_id, balance, last_sequence) — a more generic
+// account-path-based schema that supports system accounts, per-market sub-accounts,
+// and arbitrary account hierarchies without schema changes. The account_path encodes
+// the full AccountKey (e.g., "user:<uuid>:collateral" or "system:insurance:collateral").
+// This is an intentional design improvement over the docs.
 func (pw *ProjectionWorker) updateBalanceProjection(ctx context.Context, tx *sql.Tx, j JournalEntry) error {
 	// Debit account: decrease balance
 	if _, err := tx.ExecContext(ctx, `
