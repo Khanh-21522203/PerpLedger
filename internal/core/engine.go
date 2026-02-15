@@ -173,7 +173,22 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 		c.sequence++
 	}
 
-	// Step 10: Post-checks
+	// Step 10: Post-batch margin checks for FundingEpochSettle
+	// Per flow funding-epoch-settlement-flowchart: margin checks must run AFTER
+	// funding payments are applied to balances (not before).
+	if settleEvt, ok := evt.(*event.FundingEpochSettle); ok {
+		snapshot, _ := c.fundingManager.GetFundingSnapshot(settleEvt.Market, settleEvt.EpochID)
+		if snapshot != nil {
+			allPositions := c.positionManager.GetAllPositions()
+			for _, pos := range allPositions {
+				if pos.MarketID == settleEvt.Market && !pos.IsFlat() {
+					c.checkMarginForUser(pos.UserID, pos.MarketID, snapshot.Timestamp)
+				}
+			}
+		}
+	}
+
+	// Step 10b: Post-checks
 	if err := c.postCheckInvariants(evt); err != nil {
 		panic(fmt.Sprintf("FATAL: invariant violated: %v", err))
 	}
@@ -368,55 +383,137 @@ func (c *DeterministicCore) handleDepositConfirmed(evt *event.DepositConfirmed) 
 		return nil, fmt.Errorf("unknown asset: %s", evt.Asset)
 	}
 
-	return c.journalGen.GenerateDepositConfirmed(evt, assetID)
+	batch, err := c.journalGen.GenerateDepositConfirmed(evt, assetID)
+	if err != nil {
+		return nil, err
+	}
+
+	// POST-DEPOSIT MARGIN CHECK
+	// Per flow event-dispatch-by-type: DepositConfirmed triggers margin check.
+	// Collateral increased — may resolve AtRisk status for user's positions.
+	positions := c.positionManager.GetUserPositions(evt.UserID)
+	for _, pos := range positions {
+		if !pos.IsFlat() {
+			c.checkMarginForUser(evt.UserID, pos.MarketID, evt.Timestamp.UnixMicro())
+		}
+	}
+
+	return batch, nil
 }
 
-// handleTradeFill with pre-trade margin check
+// handleTradeFill with pre-trade margin check.
+// Per flow position-lifecycle-flowchart: handles open, increase, partial reduce,
+// full close, and flip (decomposed into close + open).
 func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch, error) {
 	quoteAssetID, _ := ledger.GetAssetID("USDT")
 
 	pos := c.positionManager.GetPosition(evt.UserID, evt.Market)
 
-	// Determine if opening/increasing
-	var isOpening bool
+	// Classify the fill action
+	// Per flow position-lifecycle-flowchart: 5 cases based on position state and fill direction
+	type fillAction int
+	const (
+		fillActionOpen     fillAction = iota // No position or flat → new position
+		fillActionIncrease                   // Same side → increase existing
+		fillActionReduce                     // Opposite side, qty < pos.Size → partial reduce
+		fillActionClose                      // Opposite side, qty == pos.Size → full close
+		fillActionFlip                       // Opposite side, qty > pos.Size → close + open opposite
+	)
+
+	var action fillAction
 	if pos == nil || pos.IsFlat() {
-		isOpening = true
+		action = fillActionOpen
 	} else if pos.Side == evt.TradeSide {
-		isOpening = true
+		action = fillActionIncrease
+	} else if evt.Quantity < pos.Size {
+		action = fillActionReduce
+	} else if evt.Quantity == pos.Size {
+		action = fillActionClose
 	} else {
-		isOpening = false
+		action = fillActionFlip
+	}
+
+	isOpening := action == fillActionOpen || action == fillActionIncrease
+	isFlip := action == fillActionFlip
+
+	// REDUCE-ONLY MODE ENFORCEMENT
+	// Per flow reduce-only-mode-enforcement-flowchart:
+	// - AtRisk users can only reduce/close, NOT open/increase/flip
+	// - Flip is rejected because it creates new exposure
+	if pos != nil && pos.LiquidationState == state.LiquidationStateAtRisk {
+		if isOpening || isFlip {
+			return nil, fmt.Errorf("fill rejected: user is in reduce-only mode (AtRisk) for market %s", evt.Market)
+		}
 	}
 
 	// PRE-TRADE MARGIN CHECK (defensive)
-	if isOpening {
-		// Calculate required IM for new exposure
+	// Per flow pre-trade-margin-check-flowchart: compute total IM across ALL positions
+	if isOpening || isFlip {
 		params, ok := c.riskParamsMgr.GetRiskParams(evt.Market)
 		if !ok {
 			return nil, fmt.Errorf("no risk params for market %s", evt.Market)
 		}
 
-		currentSize := int64(0)
-		if pos != nil {
-			currentSize = pos.Size
+		// Per flow: use mark_price for notional computation, not fill price
+		markPrice, hasMarkPrice := c.positionManager.GetMarkPrice(evt.Market)
+		if !hasMarkPrice {
+			// Fallback to fill price if no mark price available yet
+			markPrice = evt.Price
 		}
 
-		newSize := currentSize + evt.Quantity
-		newNotional := fpmath.ComputeNotional(
-			newSize,
-			evt.Price,
+		// Compute new size for this market's position
+		var newSizeThisMarket int64
+		if isFlip {
+			// Flip: new position size = fill.qty - old_position.size
+			newSizeThisMarket = evt.Quantity - pos.Size
+		} else if pos != nil && !pos.IsFlat() {
+			// Increase: current + fill
+			newSizeThisMarket = pos.Size + evt.Quantity
+		} else {
+			// New position
+			newSizeThisMarket = evt.Quantity
+		}
+
+		newNotionalThisMarket := fpmath.ComputeNotional(
+			newSizeThisMarket,
+			markPrice,
 			fpmath.PriceConfig.Scale,
 			fpmath.QuantityConfig.Scale,
 			fpmath.QuoteConfig.Scale,
 		)
+		requiredIMThisMarket := newNotionalThisMarket * params.IMFraction / 1_000_000
 
-		requiredIM := newNotional * params.IMFraction / 1_000_000
+		// Per flow: compute total IM across ALL positions (not just this market)
+		totalRequiredIM := requiredIMThisMarket
+		allPositions := c.positionManager.GetUserPositions(evt.UserID)
+		for _, otherPos := range allPositions {
+			if otherPos.MarketID == evt.Market || otherPos.IsFlat() {
+				continue
+			}
+			otherParams, ok := c.riskParamsMgr.GetRiskParams(otherPos.MarketID)
+			if !ok {
+				continue
+			}
+			otherNotional, err := c.positionManager.ComputePositionNotional(otherPos)
+			if err != nil {
+				continue
+			}
+			totalRequiredIM += otherNotional * otherParams.IMFraction / 1_000_000
+		}
+
 		effectiveCollateral := c.marginCalc.ComputeEffectiveCollateral(evt.UserID, quoteAssetID)
 
-		if effectiveCollateral < requiredIM {
-			// REJECT FILL - insufficient margin
+		if effectiveCollateral < totalRequiredIM {
 			return nil, fmt.Errorf("fill rejected: insufficient margin (have=%d, need=%d)",
-				effectiveCollateral, requiredIM)
+				effectiveCollateral, totalRequiredIM)
 		}
+	}
+
+	// Capture reserved balance BEFORE position mutation for margin release calculation
+	reservedBeforeFill := c.balanceTracker.GetUserReservedBalance(evt.UserID, quoteAssetID)
+	oldSize := int64(0)
+	if pos != nil {
+		oldSize = pos.Size
 	}
 
 	// Apply trade to position
@@ -428,10 +525,12 @@ func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch
 		evt.Price,
 	)
 
-	// Calculate margin amounts
+	// Calculate margin amounts based on fill action
 	var marginReserve, marginRelease int64
 
-	if isOpening {
+	switch action {
+	case fillActionOpen, fillActionIncrease:
+		// Reserve IM for new/additional exposure
 		notional := fpmath.ComputeNotional(
 			evt.Quantity,
 			evt.Price,
@@ -439,24 +538,42 @@ func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch
 			fpmath.QuantityConfig.Scale,
 			fpmath.QuoteConfig.Scale,
 		)
-
 		params, _ := c.riskParamsMgr.GetRiskParams(evt.Market)
 		marginReserve = notional * params.IMFraction / 1_000_000
 
-	} else {
-		// Proportional release
-		if pos != nil && !pos.IsFlat() {
-			reserved := c.balanceTracker.GetUserReservedBalance(evt.UserID, quoteAssetID)
-			originalSize := pos.Size + evt.Quantity
-			marginRelease = reserved * evt.Quantity / originalSize
+	case fillActionReduce:
+		// Per flow position-lifecycle-flowchart: proportional IM release
+		if oldSize > 0 {
+			marginRelease = reservedBeforeFill * evt.Quantity / oldSize
 		}
+
+	case fillActionClose:
+		// Per flow position-lifecycle-flowchart: release ALL reserved margin
+		marginRelease = reservedBeforeFill
+
+	case fillActionFlip:
+		// Per flow position-lifecycle-flowchart: close existing (release all) + open new (reserve)
+		// Step 1: Release ALL margin from closed position
+		marginRelease = reservedBeforeFill
+
+		// Step 2: Reserve IM for new position in opposite direction
+		remainingQty := evt.Quantity - oldSize
+		notional := fpmath.ComputeNotional(
+			remainingQty,
+			evt.Price,
+			fpmath.PriceConfig.Scale,
+			fpmath.QuantityConfig.Scale,
+			fpmath.QuoteConfig.Scale,
+		)
+		params, _ := c.riskParamsMgr.GetRiskParams(evt.Market)
+		marginReserve = notional * params.IMFraction / 1_000_000
 	}
 
 	batch, err := c.journalGen.GenerateTradeFill(
 		evt.UserID,
 		evt.FillID,
 		evt.Market,
-		isOpening,
+		isOpening || isFlip,
 		evt.Fee,
 		marginReserve,
 		marginRelease,
@@ -486,26 +603,103 @@ func (c *DeterministicCore) checkMarginForUser(userID uuid.UUID, marketID string
 	}
 
 	marginStatus := c.marginCalc.CheckMarginHealth(userID, quoteAssetID)
+	prevState := pos.LiquidationState
 
 	switch marginStatus {
 	case state.MarginStatusLiquidatable:
-		if pos.LiquidationState == state.LiquidationStateHealthy {
+		// Per flow margin-check-triggers-flowchart + liquidation-state-machine-flowchart:
+		// Healthy → AtRisk first (emit ReduceOnlyModeEntered), then trigger liquidation.
+		// AtRisk → InLiquidation (trigger liquidation).
+		switch pos.LiquidationState {
+		case state.LiquidationStateHealthy:
+			// Transition through AtRisk first so ReduceOnlyModeEntered is emitted
+			pos.LiquidationState = state.LiquidationStateAtRisk
+			pos.Version++
+			c.emitReduceOnlyEvents(userID, marketID, prevState, pos.LiquidationState, parentTimestamp)
+			// Now trigger liquidation (AtRisk → InLiquidation)
 			c.triggerLiquidation(userID, marketID, parentTimestamp)
+		case state.LiquidationStateAtRisk:
+			// Already AtRisk, now below MM → trigger liquidation
+			c.triggerLiquidation(userID, marketID, parentTimestamp)
+		case state.LiquidationStatePartiallyLiquidated:
+			// Still below MM after partial liquidation — stay in liquidation, no action needed
+			// Liquidation engine will continue sending fills
 		}
+
 	case state.MarginStatusAtRisk:
 		if pos.LiquidationState == state.LiquidationStateHealthy {
 			pos.LiquidationState = state.LiquidationStateAtRisk
 			pos.Version++
 		}
+
 	case state.MarginStatusHealthy:
-		if pos.LiquidationState == state.LiquidationStateAtRisk {
+		// Per flow reduce-only-mode-enforcement-flowchart:
+		// Recovery requires margin_fraction >= im_fraction (hysteresis)
+		if pos.LiquidationState == state.LiquidationStateAtRisk ||
+			pos.LiquidationState == state.LiquidationStatePartiallyLiquidated {
 			marginFraction := c.marginCalc.ComputeMarginFraction(userID, quoteAssetID)
 			params, _ := c.riskParamsMgr.GetRiskParams(marketID)
 			if marginFraction >= params.IMFraction {
+				// Recover: stop liquidation if partially liquidated
+				if pos.LiquidationState == state.LiquidationStatePartiallyLiquidated {
+					if pos.LiquidationID != nil {
+						liqID, err := uuid.Parse(*pos.LiquidationID)
+						if err == nil {
+							c.liquidationMgr.CheckMarginRecovery(liqID, true)
+						}
+					}
+				}
 				pos.LiquidationState = state.LiquidationStateHealthy
+				pos.LiquidationID = nil
 				pos.Version++
 			}
 		}
+	}
+
+	// Emit ReduceOnlyMode events on AtRisk transitions
+	// (Skip if already emitted above in the Liquidatable→Healthy→AtRisk path)
+	if !(prevState == state.LiquidationStateHealthy && marginStatus == state.MarginStatusLiquidatable) {
+		c.emitReduceOnlyEvents(userID, marketID, prevState, pos.LiquidationState, parentTimestamp)
+	}
+}
+
+// emitReduceOnlyEvents publishes ReduceOnlyModeEntered/Exited to the projection channel
+// when a position transitions to/from AtRisk state.
+// Per glossary: ReduceOnlyModeEntered and ReduceOnlyModeExited are outbound events.
+func (c *DeterministicCore) emitReduceOnlyEvents(
+	userID uuid.UUID,
+	marketID string,
+	prevState, newState state.LiquidationState,
+	parentTimestamp int64,
+) {
+	if prevState == newState {
+		return
+	}
+
+	var evtType event.EventType
+
+	if newState == state.LiquidationStateAtRisk && prevState == state.LiquidationStateHealthy {
+		evtType = event.EventTypeReduceOnlyModeEntered
+	} else if newState == state.LiquidationStateHealthy && prevState == state.LiquidationStateAtRisk {
+		evtType = event.EventTypeReduceOnlyModeExited
+	} else {
+		return
+	}
+
+	output := CoreOutput{
+		Envelope: &event.EventEnvelope{
+			Sequence:       c.sequence,
+			IdempotencyKey: fmt.Sprintf("reduce_only:%s:%s:%d", userID, marketID, c.sequence),
+			EventType:      evtType,
+			MarketID:       &marketID,
+			Timestamp:      time.UnixMicro(parentTimestamp),
+		},
+	}
+
+	// Non-blocking send to projection channel only (informational event)
+	select {
+	case c.projectionChan <- output:
+	default:
 	}
 }
 
@@ -551,33 +745,57 @@ func (c *DeterministicCore) checkMarginForMarket(marketID string, parentTimestam
 
 		// Check margin health
 		marginStatus := c.marginCalc.CheckMarginHealth(pos.UserID, quoteAssetID)
+		prevState := pos.LiquidationState
 
 		switch marginStatus {
 		case state.MarginStatusLiquidatable:
-			// Trigger liquidation if not already triggered
-			if pos.LiquidationState == state.LiquidationStateHealthy {
+			// Per flow: Healthy → AtRisk (emit ReduceOnlyModeEntered) → InLiquidation
+			// AtRisk → InLiquidation directly
+			switch pos.LiquidationState {
+			case state.LiquidationStateHealthy:
+				pos.LiquidationState = state.LiquidationStateAtRisk
+				pos.Version++
+				c.emitReduceOnlyEvents(pos.UserID, pos.MarketID, prevState, pos.LiquidationState, parentTimestamp)
 				c.triggerLiquidation(pos.UserID, pos.MarketID, parentTimestamp)
+			case state.LiquidationStateAtRisk:
+				c.triggerLiquidation(pos.UserID, pos.MarketID, parentTimestamp)
+			case state.LiquidationStatePartiallyLiquidated:
+				// Still below MM — liquidation engine continues sending fills
 			}
 
 		case state.MarginStatusAtRisk:
-			// Transition to AtRisk if currently Healthy
 			if pos.LiquidationState == state.LiquidationStateHealthy {
 				pos.LiquidationState = state.LiquidationStateAtRisk
 				pos.Version++
 			}
 
 		case state.MarginStatusHealthy:
-			// Check if we can recover from AtRisk
-			if pos.LiquidationState == state.LiquidationStateAtRisk {
-				// Must recover to IM, not just MM
+			// Per flow: recovery requires margin_fraction >= im_fraction (hysteresis)
+			if pos.LiquidationState == state.LiquidationStateAtRisk ||
+				pos.LiquidationState == state.LiquidationStatePartiallyLiquidated {
 				marginFraction := c.marginCalc.ComputeMarginFraction(pos.UserID, quoteAssetID)
 				params, _ := c.riskParamsMgr.GetRiskParams(pos.MarketID)
 
 				if marginFraction >= params.IMFraction {
+					if pos.LiquidationState == state.LiquidationStatePartiallyLiquidated {
+						if pos.LiquidationID != nil {
+							liqID, err := uuid.Parse(*pos.LiquidationID)
+							if err == nil {
+								c.liquidationMgr.CheckMarginRecovery(liqID, true)
+							}
+						}
+					}
 					pos.LiquidationState = state.LiquidationStateHealthy
+					pos.LiquidationID = nil
 					pos.Version++
 				}
 			}
+		}
+
+		// Emit ReduceOnlyMode events on AtRisk transitions
+		// (Skip if already emitted above in the Liquidatable→Healthy→AtRisk path)
+		if !(prevState == state.LiquidationStateHealthy && marginStatus == state.MarginStatusLiquidatable) {
+			c.emitReduceOnlyEvents(pos.UserID, pos.MarketID, prevState, pos.LiquidationState, parentTimestamp)
 		}
 	}
 }
@@ -774,14 +992,9 @@ func (c *DeterministicCore) handleFundingEpochSettle(evt *event.FundingEpochSett
 		}
 	}
 
-	// POST-FUNDING MARGIN CHECK
-	// Per doc margin-check-triggers: FundingEpochSettle triggers margin checks
-	// for all affected users. Funding payments can reduce collateral below MM.
-	for _, pos := range allPositions {
-		if pos.MarketID == evt.Market && !pos.IsFlat() {
-			c.checkMarginForUser(pos.UserID, pos.MarketID, snapshot.Timestamp)
-		}
-	}
+	// NOTE: POST-FUNDING MARGIN CHECK is deferred to ProcessEvent after batches
+	// are applied to balances. Running it here would use stale (pre-funding) balances.
+	// See postBatchMarginChecks() called from ProcessEvent.
 
 	return batches, nil
 }
@@ -810,13 +1023,28 @@ func (c *DeterministicCore) handleWithdrawalRequested(evt *event.WithdrawalReque
 		return nil, fmt.Errorf("unknown asset: %s", evt.Asset)
 	}
 
-	return c.journalGen.GenerateWithdrawalRequested(
+	batch, err := c.journalGen.GenerateWithdrawalRequested(
 		evt.UserID,
 		evt.WithdrawalID,
 		evt.Amount,
 		assetID,
 		evt.Timestamp.UnixMicro(),
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	// POST-WITHDRAWAL MARGIN CHECK
+	// Per flow event-dispatch-by-type: WithdrawalRequested triggers margin check.
+	// Collateral decreased — may push user below MM threshold.
+	positions := c.positionManager.GetUserPositions(evt.UserID)
+	for _, pos := range positions {
+		if !pos.IsFlat() {
+			c.checkMarginForUser(evt.UserID, pos.MarketID, evt.Timestamp.UnixMicro())
+		}
+	}
+
+	return batch, nil
 }
 
 func (c *DeterministicCore) handleWithdrawalConfirmed(evt *event.WithdrawalConfirmed) (*ledger.Batch, error) {
@@ -917,9 +1145,10 @@ func (c *DeterministicCore) handleLiquidationCompleted(evt *event.LiquidationCom
 // handleRiskParamUpdate processes a risk parameter update for a market.
 // Per docs §8: update in-memory risk params, recompute margin for all positions
 // in the market, trigger liquidation for any user whose margin now violates MM.
-// No journal entries are generated — this only mutates in-memory state.
+// Per flow risk-param-update-flowchart: after updating params, adjust reserved
+// margin for each position (reserve more if new_IM > old_reserved, release if less).
 func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*ledger.Batch, error) {
-	c.riskParamsMgr.UpdateRiskParams(&state.RiskParams{
+	newParams := &state.RiskParams{
 		MarketID:     evt.Market,
 		IMFraction:   evt.IMFraction,
 		MMFraction:   evt.MMFraction,
@@ -927,19 +1156,82 @@ func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*
 		TickSize:     evt.TickSize,
 		LotSize:      evt.LotSize,
 		EffectiveSeq: evt.EffectiveSeq,
-	})
+	}
 
-	// Recompute margin for all positions in this market
-	c.checkMarginForMarket(evt.Market, evt.Timestamp)
+	if err := c.riskParamsMgr.UpdateRiskParams(newParams); err != nil {
+		return nil, fmt.Errorf("risk param update rejected: %w", err)
+	}
 
-	// Return empty batch (risk param updates don't generate journals)
-	return &ledger.Batch{
-		BatchID:   uuid.New(),
+	quoteAssetID, _ := ledger.GetAssetID("USDT")
+	batchID := uuid.New()
+	batch := &ledger.Batch{
+		BatchID:   batchID,
 		EventRef:  evt.IdempotencyKey(),
 		Sequence:  c.sequence,
 		Timestamp: evt.Timestamp,
-		Journals:  []ledger.Journal{},
-	}, nil
+		Journals:  make([]ledger.Journal, 0),
+	}
+
+	// Adjust reserved margin for all positions in this market
+	allPositions := c.positionManager.GetAllPositions()
+	for _, pos := range allPositions {
+		if pos.MarketID != evt.Market || pos.IsFlat() {
+			continue
+		}
+
+		// Compute required IM under new params
+		notional, err := c.positionManager.ComputePositionNotional(pos)
+		if err != nil {
+			continue
+		}
+		requiredIM := notional * newParams.IMFraction / 1_000_000
+
+		// Current reserved balance for this user
+		currentReserved := c.balanceTracker.GetUserReservedBalance(pos.UserID, quoteAssetID)
+
+		if requiredIM > currentReserved {
+			// Need to reserve more: collateral → reserved
+			delta := requiredIM - currentReserved
+			available := c.balanceTracker.GetUserAvailableBalance(pos.UserID, quoteAssetID)
+			if delta > available {
+				delta = available // Reserve what's available; margin check below handles the rest
+			}
+			if delta > 0 {
+				batch.Journals = append(batch.Journals, ledger.Journal{
+					JournalID:     uuid.New(),
+					BatchID:       batchID,
+					EventRef:      evt.IdempotencyKey(),
+					Sequence:      c.sequence,
+					DebitAccount:  ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeReserved, quoteAssetID),
+					CreditAccount: ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeCollateral, quoteAssetID),
+					AssetID:       quoteAssetID,
+					Amount:        delta,
+					JournalType:   ledger.JournalTypeMarginReserve,
+					Timestamp:     evt.Timestamp,
+				})
+			}
+		} else if requiredIM < currentReserved {
+			// Release excess: reserved → collateral
+			delta := currentReserved - requiredIM
+			batch.Journals = append(batch.Journals, ledger.Journal{
+				JournalID:     uuid.New(),
+				BatchID:       batchID,
+				EventRef:      evt.IdempotencyKey(),
+				Sequence:      c.sequence,
+				DebitAccount:  ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeCollateral, quoteAssetID),
+				CreditAccount: ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeReserved, quoteAssetID),
+				AssetID:       quoteAssetID,
+				Amount:        delta,
+				JournalType:   ledger.JournalTypeMarginRelease,
+				Timestamp:     evt.Timestamp,
+			})
+		}
+	}
+
+	// Recompute margin for all positions in this market (may trigger liquidations)
+	c.checkMarginForMarket(evt.Market, evt.Timestamp)
+
+	return batch, nil
 }
 
 func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error) {

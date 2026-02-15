@@ -22,6 +22,8 @@ const (
 	EventTypeLiquidationTriggered
 	EventTypeLiquidationFill
 	EventTypeLiquidationCompleted
+	EventTypeReduceOnlyModeEntered
+	EventTypeReduceOnlyModeExited
 )
 
 // EventEnvelope wraps every event in the log
@@ -97,6 +99,8 @@ func (et EventType) String() string {
 		return "LiquidationCompleted"
 	case EventTypeRiskParamUpdate:
 		return "RiskParamUpdate"
+	case EventTypeReduceOnlyModeEntered: return "ReduceOnlyModeEntered"
+	case EventTypeReduceOnlyModeExited: return "ReduceOnlyModeExited"
 	default:
 		return "Unknown"
 	}

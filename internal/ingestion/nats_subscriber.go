@@ -65,7 +65,7 @@ func NewNATSSubscriber(js jetstream.JetStream, eventChan chan<- RawEvent) *NATSS
 }
 
 // Subscribe creates JetStream consumers for all configured subjects.
-// Per doc §15: consumers use explicit ACK, max_deliver=5, ack_wait=30s.
+// Consumers use explicit ACK, max_deliver=5, ack_wait=30s.
 func (ns *NATSSubscriber) Subscribe(ctx context.Context, subjects []SubjectConfig) error {
 	for _, cfg := range subjects {
 		consumer, err := ns.js.CreateOrUpdateConsumer(ctx, cfg.StreamName, jetstream.ConsumerConfig{
@@ -80,7 +80,7 @@ func (ns *NATSSubscriber) Subscribe(ctx context.Context, subjects []SubjectConfi
 			return fmt.Errorf("create consumer %s: %w", cfg.ConsumerName, err)
 		}
 
-		cc, err := consumer.Consume(func(msg jetstream.Msg) {
+		consumerContext, err := consumer.Consume(func(msg jetstream.Msg) {
 			raw := RawEvent{
 				Subject:   msg.Subject(),
 				Data:      msg.Data(),
@@ -100,7 +100,7 @@ func (ns *NATSSubscriber) Subscribe(ctx context.Context, subjects []SubjectConfi
 			return fmt.Errorf("consume %s: %w", cfg.ConsumerName, err)
 		}
 
-		ns.consumers = append(ns.consumers, cc)
+		ns.consumers = append(ns.consumers, consumerContext)
 		log.Printf("INFO: subscribed to %s (consumer=%s)", cfg.Subject, cfg.ConsumerName)
 	}
 
@@ -211,4 +211,3 @@ func ConnectNATS(url string) (*nats.Conn, jetstream.JetStream, error) {
 
 	return nc, js, nil
 }
-

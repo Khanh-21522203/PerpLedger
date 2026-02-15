@@ -149,18 +149,19 @@ func TestDepositConfirmed_IncreasesCollateral(t *testing.T) {
 		t.Fatalf("expected 1 output, got %d", len(outputs))
 	}
 
-	// Verify batch has 1 journal (deposit)
+	// Verify batch has 2 journals (clear pending + credit collateral)
 	batch := outputs[0].Batch
-	if len(batch.Journals) != 1 {
-		t.Fatalf("expected 1 journal, got %d", len(batch.Journals))
+	if len(batch.Journals) != 2 {
+		t.Fatalf("expected 2 journals, got %d", len(batch.Journals))
 	}
 
-	j := batch.Journals[0]
-	if j.Amount != 1_000_000 {
-		t.Errorf("expected amount 1_000_000, got %d", j.Amount)
-	}
-	if j.JournalType != ledger.JournalTypeDepositConfirm {
-		t.Errorf("expected JournalTypeDepositConfirm, got %d", j.JournalType)
+	for _, j := range batch.Journals {
+		if j.Amount != 1_000_000 {
+			t.Errorf("expected amount 1_000_000, got %d", j.Amount)
+		}
+		if j.JournalType != ledger.JournalTypeDepositConfirm {
+			t.Errorf("expected JournalTypeDepositConfirm, got %d", j.JournalType)
+		}
 	}
 }
 

@@ -23,8 +23,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Config holds all application configuration.
@@ -63,10 +63,10 @@ func DefaultConfig() Config {
 	return Config{
 		PostgresURL:            envOrDefault("PERP_POSTGRES_DSN", "postgres://perp:perp_dev_password@localhost:5432/perpledger?sslmode=disable"),
 		NATSURL:                envOrDefault("PERP_NATS_URL", "nats://localhost:4222"),
-		PersistChanSize:        envIntOrDefault("PERP_PERSIST_CHAN_SIZE", 1024),      // Per doc §3: persist channel capacity
-		ProjectionChanSize:     envIntOrDefault("PERP_PROJECTION_CHAN_SIZE", 2048),    // Per doc §3: projection channel capacity
-		PersistBatchSize:       envIntOrDefault("PERP_PERSIST_BATCH_SIZE", 50),       // Per doc §4.3: batch size
-		PersistFlushTimeout:    10 * time.Millisecond,                                 // Per doc §4.3: batch timeout
+		PersistChanSize:        envIntOrDefault("PERP_PERSIST_CHAN_SIZE", 1024),    // Per doc §3: persist channel capacity
+		ProjectionChanSize:     envIntOrDefault("PERP_PROJECTION_CHAN_SIZE", 2048), // Per doc §3: projection channel capacity
+		PersistBatchSize:       envIntOrDefault("PERP_PERSIST_BATCH_SIZE", 50),     // Per doc §4.3: batch size
+		PersistFlushTimeout:    10 * time.Millisecond,                              // Per doc §4.3: batch timeout
 		SnapshotInterval:       int64(envIntOrDefault("PERP_SNAPSHOT_INTERVAL", 100_000)),
 		GRPCAddr:               envOrDefault("PERP_GRPC_ADDR", ":9090"),
 		HTTPAddr:               envOrDefault("PERP_HTTP_ADDR", ":8080"),
@@ -81,6 +81,7 @@ func main() {
 	log.Println("INFO: PerpLedger starting...")
 
 	// Per doc §12: set GOGC=400 and GOMEMLIMIT for reduced GC pressure
+	// TODO: Using ObjectPool for frequent object creation, to reduce pressure on GC
 	if os.Getenv("GOGC") == "" {
 		runtime.SetFinalizer(nil, nil) // Hint: GOGC=400 should be set via env
 		log.Println("WARN: GOGC not set, recommend GOGC=400 for production")
@@ -375,7 +376,7 @@ func bridgeCoreOutputs(
 				marketID = &s
 			}
 
-            // Convert [32]byte arrays to []byte slices for persistence
+			// Convert [32]byte arrays to []byte slices for persistence
 			stateHash := output.Envelope.StateHash[:]
 			prevHash := output.Envelope.PrevHash[:]
 
@@ -484,39 +485,68 @@ func runIngestionLoop(ctx context.Context, rawChan <-chan ingestion.RawEvent, co
 		subjectToType[prefix] = cfg.EventType
 	}
 
+	// Per flow nats-ack-and-backpressure-sequence: messages are acked after
+	// being sent to the InboundChannel (i.e. after parse+validate), NOT after
+	// core processing. This prevents AckWait expiry during slow core processing
+	// and naturally propagates backpressure via channel blocking.
+	typedEventChan := make(chan event.Event, 4096)
+
+	// Goroutine: parse raw events and forward to typed channel, then ack
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case raw, ok := <-rawChan:
+				if !ok {
+					close(typedEventChan)
+					return
+				}
+
+				// Resolve event type from NATS subject by matching longest prefix
+				eventType := resolveEventType(raw.Subject, subjectToType)
+				if eventType == "" {
+					log.Printf("WARN: unknown NATS subject: %s", raw.Subject)
+					raw.AckFunc() // Ack invalid events to avoid redelivery loop
+					continue
+				}
+
+				evt, err := ingestion.ParseRawEvent(raw, eventType)
+				if err != nil {
+					log.Printf("WARN: parse event failed (subject=%s): %v", raw.Subject, err)
+					raw.AckFunc() // Ack unparseable events per flow (invalid events acked but not forwarded)
+					continue
+				}
+
+				// Blocking send to typed channel — backpressure propagates to NATS
+				select {
+				case typedEventChan <- evt:
+					raw.AckFunc() // Ack AFTER successful channel send
+				case <-ctx.Done():
+					raw.NakFunc()
+					return
+				}
+			}
+		}
+	}()
+
+	// Core processing loop: drain typed events
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case raw, ok := <-rawChan:
+		case evt, ok := <-typedEventChan:
 			if !ok {
 				return
-			}
-
-			// Resolve event type from NATS subject by matching longest prefix
-			eventType := resolveEventType(raw.Subject, subjectToType)
-			if eventType == "" {
-				log.Printf("WARN: unknown NATS subject: %s", raw.Subject)
-				raw.NakFunc()
-				continue
-			}
-
-			evt, err := ingestion.ParseRawEvent(raw, eventType)
-			if err != nil {
-				log.Printf("WARN: parse event failed (subject=%s): %v", raw.Subject, err)
-				raw.NakFunc()
-				continue
 			}
 
 			if err := core.ProcessEvent(evt); err != nil {
 				log.Printf("ERROR: core.ProcessEvent failed (type=%s, key=%s): %v",
 					evt.EventType(), evt.IdempotencyKey(), err)
-				// NAK so NATS redelivers (up to MaxDeliver)
-				raw.NakFunc()
-				continue
+				// Event already acked — core errors are logged but not retried via NATS.
+				// The event is in the channel and will be persisted if it was a transient error,
+				// or silently skipped if it was a validation error (dedup, gap, etc).
 			}
-
-			raw.AckFunc()
 		}
 	}
 }

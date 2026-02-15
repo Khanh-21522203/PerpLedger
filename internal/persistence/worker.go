@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 )
@@ -81,10 +82,8 @@ func (pw *PersistenceWorker) Run(ctx context.Context) error {
 
 			// Flush if batch is full
 			if len(eventBatch) >= pw.batchSize {
-				if err := pw.flush(ctx, eventBatch, journalBatch); err != nil {
-					log.Printf("ERROR: batch flush failed: %v", err)
-					// Continue — the data is still in the core's in-memory state
-					// and will be re-persisted on recovery
+				if err := pw.flushWithRetry(ctx, eventBatch, journalBatch); err != nil {
+					log.Printf("ERROR: batch flush failed after retries: %v", err)
 				}
 				eventBatch = eventBatch[:0]
 				journalBatch = journalBatch[:0]
@@ -94,8 +93,8 @@ func (pw *PersistenceWorker) Run(ctx context.Context) error {
 		case <-timer.C:
 			// Flush timeout — write whatever we have
 			if len(eventBatch) > 0 {
-				if err := pw.flush(ctx, eventBatch, journalBatch); err != nil {
-					log.Printf("ERROR: timeout flush failed: %v", err)
+				if err := pw.flushWithRetry(ctx, eventBatch, journalBatch); err != nil {
+					log.Printf("ERROR: timeout flush failed after retries: %v", err)
 				}
 				eventBatch = eventBatch[:0]
 				journalBatch = journalBatch[:0]
@@ -103,6 +102,41 @@ func (pw *PersistenceWorker) Run(ctx context.Context) error {
 			timer.Reset(pw.flushTimeout)
 		}
 	}
+}
+
+// flushWithRetry attempts to flush with exponential backoff.
+// Per flow persistence-worker-batching-flowchart: on write failure, retry with
+// exponential backoff. Never drop events.
+func (pw *PersistenceWorker) flushWithRetry(ctx context.Context, events []EventRow, journals []JournalRow) error {
+	const maxRetries = 5
+	backoff := 100 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("WARN: persistence retry attempt %d/%d after %v", attempt, maxRetries, backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+		}
+
+		lastErr = pw.flush(ctx, events, journals)
+		if lastErr == nil {
+			return nil
+		}
+
+		if pw.metrics != nil {
+			pw.metrics.PersistErrors.WithLabelValues("retry").Inc()
+		}
+	}
+
+	return fmt.Errorf("flush failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func (pw *PersistenceWorker) flush(ctx context.Context, events []EventRow, journals []JournalRow) error {

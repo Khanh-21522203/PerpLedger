@@ -52,14 +52,22 @@ type Batch struct {
 }
 
 // Validate ensures the batch is well-formed.
-// Note on balance invariant: each journal entry is a balanced transfer by construction
-// (a single positive amount moves from credit account to debit account). Therefore
-// Σ debits == Σ credits is guaranteed per-entry. Multi-leg batches (e.g., trade with fee)
-// use multiple entries under one batch_id — each individually balanced.
+// Per flow deterministic-core-event-loop-flowchart: "Verify journal batch balanced:
+// sum debits == sum credits". Each journal entry transfers Amount from CreditAccount
+// to DebitAccount. We verify per-entry invariants AND that the batch is globally
+// balanced per asset (net flow across all accounts sums to zero).
 func (b *Batch) Validate() error {
 	if len(b.Journals) == 0 {
 		return fmt.Errorf("batch %s is empty", b.BatchID)
 	}
+
+	// Per-asset balance check: track net flow per (account, asset)
+	// Debit increases balance (+Amount), Credit decreases balance (-Amount)
+	type accountAsset struct {
+		Account AccountKey
+		Asset   AssetID
+	}
+	netFlows := make(map[accountAsset]int64)
 
 	for _, j := range b.Journals {
 		// Validate amount is positive (L-02)
@@ -75,6 +83,21 @@ func (b *Batch) Validate() error {
 		// Validate debit != credit (no self-transfers)
 		if j.DebitAccount == j.CreditAccount {
 			return fmt.Errorf("journal %s has same debit and credit account", j.JournalID)
+		}
+
+		// Accumulate net flows per account per asset
+		netFlows[accountAsset{j.DebitAccount, j.AssetID}] += j.Amount
+		netFlows[accountAsset{j.CreditAccount, j.AssetID}] -= j.Amount
+	}
+
+	// Verify global balance: sum of all flows per asset must be zero
+	assetTotals := make(map[AssetID]int64)
+	for key, flow := range netFlows {
+		assetTotals[key.Asset] += flow
+	}
+	for assetID, total := range assetTotals {
+		if total != 0 {
+			return fmt.Errorf("batch %s is unbalanced for asset %d: net=%d", b.BatchID, assetID, total)
 		}
 	}
 

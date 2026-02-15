@@ -41,8 +41,12 @@ func (mc *MarginCalculator) ComputeEffectiveCollateral(
 	var effectiveCollateral int64
 
 	// Contribution from quote asset (no haircut, no price conversion)
+	// Per flow margin-computation-flowchart: effective collateral includes
+	// available (collateral) + reserved (margin-locked) balances.
+	// Reserved margin still belongs to the user for margin fraction computation.
 	available := mc.balanceTracker.GetUserAvailableBalance(userID, quoteAssetID)
-	effectiveCollateral += available
+	reserved := mc.balanceTracker.GetUserReservedBalance(userID, quoteAssetID)
+	effectiveCollateral += available + reserved
 
 	// TODO: Multi-asset collateral with haircuts (post-MVP)
 	// For MVP, only USDT collateral

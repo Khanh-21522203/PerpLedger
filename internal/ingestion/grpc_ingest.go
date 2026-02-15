@@ -9,6 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// ErrResourceExhausted is returned when the event channel is full.
+// Per flow grpc-ingest-flowchart: non-blocking send returns RESOURCE_EXHAUSTED if full.
+var ErrResourceExhausted = fmt.Errorf("RESOURCE_EXHAUSTED: event channel is full, try again later")
+
 // GRPCIngestService provides admin/manual event injection via gRPC.
 // Per doc §15: gRPC ingest is for admin operations and manual event injection,
 // not for high-throughput ingestion (use NATS for that).
@@ -23,6 +27,17 @@ func NewGRPCIngestService(eventChan chan<- event.Event) *GRPCIngestService {
 // EventChan returns the event channel for external injection (e.g., gRPC SubmitEvent).
 func (s *GRPCIngestService) EventChan() chan<- event.Event {
 	return s.eventChan
+}
+
+// trySend attempts a non-blocking send to the event channel.
+// Per flow grpc-ingest-flowchart: returns RESOURCE_EXHAUSTED if channel is full.
+func (s *GRPCIngestService) trySend(ctx context.Context, evt event.Event) error {
+	select {
+	case s.eventChan <- evt:
+		return nil
+	default:
+		return ErrResourceExhausted
+	}
 }
 
 // InjectDeposit manually injects a DepositConfirmed event.
@@ -47,12 +62,7 @@ func (s *GRPCIngestService) InjectDeposit(
 		Timestamp: timestamp,
 	}
 
-	select {
-	case s.eventChan <- evt:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.trySend(ctx, evt)
 }
 
 // InjectWithdrawal manually injects a WithdrawalRequested event.
@@ -76,12 +86,7 @@ func (s *GRPCIngestService) InjectWithdrawal(
 		Timestamp:    timestamp,
 	}
 
-	select {
-	case s.eventChan <- evt:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.trySend(ctx, evt)
 }
 
 // InjectMarkPrice manually injects a MarkPriceUpdate event.
@@ -104,12 +109,7 @@ func (s *GRPCIngestService) InjectMarkPrice(
 		IndexPrice:     markPrice, // Default: same as mark price
 	}
 
-	select {
-	case s.eventChan <- evt:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.trySend(ctx, evt)
 }
 
 // InjectFundingSnapshot manually injects a FundingRateSnapshot event.
@@ -129,12 +129,7 @@ func (s *GRPCIngestService) InjectFundingSnapshot(
 		EpochTs:     epochTimestampUs,
 	}
 
-	select {
-	case s.eventChan <- evt:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.trySend(ctx, evt)
 }
 
 // InjectFundingSettle manually injects a FundingEpochSettle event.
@@ -148,10 +143,5 @@ func (s *GRPCIngestService) InjectFundingSettle(
 		EpochID: epochID,
 	}
 
-	select {
-	case s.eventChan <- evt:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.trySend(ctx, evt)
 }

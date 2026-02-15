@@ -1,5 +1,7 @@
 package state
 
+import "fmt"
+
 // RiskParams defines margin requirements per market
 type RiskParams struct {
 	MarketID     string
@@ -84,6 +86,35 @@ func (rpm *RiskParamsManager) GetHaircut(asset string) int64 {
 	return 0 // Default: no haircut
 }
 
-func (rpm *RiskParamsManager) UpdateRiskParams(params *RiskParams) {
+// ValidateRiskParams checks that risk parameters are within valid ranges.
+// Per flow risk-param-update-flowchart: mm > 0, im > mm, im < 1_000_000,
+// max_leverage > 0, tick_size > 0, lot_size > 0.
+func ValidateRiskParams(params *RiskParams) error {
+	if params.MMFraction <= 0 {
+		return fmt.Errorf("mm_fraction must be > 0, got %d", params.MMFraction)
+	}
+	if params.IMFraction <= params.MMFraction {
+		return fmt.Errorf("im_fraction (%d) must be > mm_fraction (%d)", params.IMFraction, params.MMFraction)
+	}
+	if params.IMFraction >= 1_000_000 {
+		return fmt.Errorf("im_fraction must be < 1_000_000, got %d", params.IMFraction)
+	}
+	if params.MaxLeverage <= 0 {
+		return fmt.Errorf("max_leverage must be > 0, got %d", params.MaxLeverage)
+	}
+	if params.TickSize <= 0 {
+		return fmt.Errorf("tick_size must be > 0, got %d", params.TickSize)
+	}
+	if params.LotSize <= 0 {
+		return fmt.Errorf("lot_size must be > 0, got %d", params.LotSize)
+	}
+	return nil
+}
+
+func (rpm *RiskParamsManager) UpdateRiskParams(params *RiskParams) error {
+	if err := ValidateRiskParams(params); err != nil {
+		return fmt.Errorf("invalid risk params for %s: %w", params.MarketID, err)
+	}
 	rpm.params[params.MarketID] = params
+	return nil
 }
