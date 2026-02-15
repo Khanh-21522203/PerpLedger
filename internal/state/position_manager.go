@@ -268,6 +268,26 @@ func (pm *PositionManager) computeRealizedPnLForClose(pos *Position, closedQty i
 	)
 }
 
+// SetPosition directly sets a position (used for snapshot restore)
+func (pm *PositionManager) SetPosition(pos *Position) {
+	key := PositionKey{UserID: pos.UserID, MarketID: pos.MarketID}
+	pm.positions[key] = pos
+}
+
+// RestoreMarkPrice directly sets a mark price (used for snapshot restore)
+func (pm *PositionManager) RestoreMarkPrice(marketID string, mp *MarkPriceState) {
+	pm.markPrices[marketID] = mp
+}
+
+// GetAllMarkPrices returns all mark prices (for snapshot creation)
+func (pm *PositionManager) GetAllMarkPrices() map[string]*MarkPriceState {
+	result := make(map[string]*MarkPriceState, len(pm.markPrices))
+	for k, v := range pm.markPrices {
+		result[k] = v
+	}
+	return result
+}
+
 // GetAllPositions returns all positions (for iteration)
 func (pm *PositionManager) GetAllPositions() []*Position {
 	result := make([]*Position, 0, len(pm.positions))

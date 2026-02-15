@@ -258,9 +258,11 @@ func (c *DeterministicCore) computeStateDigest(batch *ledger.Batch) []byte {
 	// Collect all affected accounts
 	affectedAccounts := make(map[ledger.AccountKey]bool)
 
-	for _, j := range batch.Journals {
-		affectedAccounts[j.DebitAccount] = true
-		affectedAccounts[j.CreditAccount] = true
+	if batch != nil {
+		for _, j := range batch.Journals {
+			affectedAccounts[j.DebitAccount] = true
+			affectedAccounts[j.CreditAccount] = true
+		}
 	}
 
 	// Sort accounts deterministically
@@ -333,6 +335,18 @@ func (c *DeterministicCore) postCheckInvariants(evt event.Event) error {
 		quoteAssetID, _ := ledger.GetAssetID("USDT")
 		if err := c.validator.ValidateFundingPoolZero(e.Market, quoteAssetID); err != nil {
 			return fmt.Errorf("post-check L-07: %w", err)
+		}
+	}
+
+	// Periodic global balance check (INVARIANT L-06)
+	// Per doc ledger-invariants-verification: verify sum of all accounts == 0
+	if c.sequence > 0 && c.sequence%1000 == 0 {
+		totals := c.balanceTracker.ComputeGlobalBalance()
+		for assetID, total := range totals {
+			if total != 0 {
+				return fmt.Errorf("post-check L-06: global balance non-zero for asset %d: %d (at seq %d)",
+					assetID, total, c.sequence)
+			}
 		}
 	}
 
@@ -438,7 +452,7 @@ func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch
 		}
 	}
 
-	return c.journalGen.GenerateTradeFill(
+	batch, err := c.journalGen.GenerateTradeFill(
 		evt.UserID,
 		evt.FillID,
 		evt.Market,
@@ -450,6 +464,49 @@ func (c *DeterministicCore) handleTradeFill(evt *event.TradeFill) (*ledger.Batch
 		quoteAssetID,
 		evt.Timestamp.UnixMicro(),
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	// POST-TRADE MARGIN CHECK
+	// Per doc margin-check-triggers: TradeFill triggers margin check for the user.
+	// Fee deduction or PnL realization may push user below MM.
+	c.checkMarginForUser(evt.UserID, evt.Market, evt.Timestamp.UnixMicro())
+
+	return batch, nil
+}
+
+// checkMarginForUser checks margin health for a single user in a specific market.
+func (c *DeterministicCore) checkMarginForUser(userID uuid.UUID, marketID string, parentTimestamp int64) {
+	quoteAssetID, _ := ledger.GetAssetID("USDT")
+
+	pos := c.positionManager.GetPosition(userID, marketID)
+	if pos == nil || pos.IsFlat() {
+		return
+	}
+
+	marginStatus := c.marginCalc.CheckMarginHealth(userID, quoteAssetID)
+
+	switch marginStatus {
+	case state.MarginStatusLiquidatable:
+		if pos.LiquidationState == state.LiquidationStateHealthy {
+			c.triggerLiquidation(userID, marketID, parentTimestamp)
+		}
+	case state.MarginStatusAtRisk:
+		if pos.LiquidationState == state.LiquidationStateHealthy {
+			pos.LiquidationState = state.LiquidationStateAtRisk
+			pos.Version++
+		}
+	case state.MarginStatusHealthy:
+		if pos.LiquidationState == state.LiquidationStateAtRisk {
+			marginFraction := c.marginCalc.ComputeMarginFraction(userID, quoteAssetID)
+			params, _ := c.riskParamsMgr.GetRiskParams(marketID)
+			if marginFraction >= params.IMFraction {
+				pos.LiquidationState = state.LiquidationStateHealthy
+				pos.Version++
+			}
+		}
+	}
 }
 
 // handleMarkPriceUpdate processes mark price update and triggers margin checks.
@@ -468,7 +525,7 @@ func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*
 	}
 
 	// Trigger margin checks for all positions in this market
-	c.checkMarginForMarket(evt.Market)
+	c.checkMarginForMarket(evt.Market, evt.PriceTimestamp)
 
 	// Return empty batch (mark price doesn't generate journals)
 	return &ledger.Batch{
@@ -480,8 +537,9 @@ func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*
 	}, nil
 }
 
-// checkMarginForMarket checks all positions in a market
-func (c *DeterministicCore) checkMarginForMarket(marketID string) {
+// checkMarginForMarket checks all positions in a market.
+// parentTimestamp is the deterministic timestamp from the triggering event.
+func (c *DeterministicCore) checkMarginForMarket(marketID string, parentTimestamp int64) {
 	allPositions := c.positionManager.GetAllPositions()
 
 	quoteAssetID, _ := ledger.GetAssetID("USDT")
@@ -498,7 +556,7 @@ func (c *DeterministicCore) checkMarginForMarket(marketID string) {
 		case state.MarginStatusLiquidatable:
 			// Trigger liquidation if not already triggered
 			if pos.LiquidationState == state.LiquidationStateHealthy {
-				c.triggerLiquidation(pos.UserID, pos.MarketID)
+				c.triggerLiquidation(pos.UserID, pos.MarketID, parentTimestamp)
 			}
 
 		case state.MarginStatusAtRisk:
@@ -527,8 +585,14 @@ func (c *DeterministicCore) checkMarginForMarket(marketID string) {
 // triggerLiquidation creates a LiquidationTriggered event and emits it.
 // Per docs §6.2: published to NATS "liquidations.triggered" for the external
 // liquidation engine to begin unwinding the position.
-func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string) {
-	liquidationID, err := c.liquidationMgr.TriggerLiquidation(userID, marketID, c.sequence)
+// parentTimestamp is the deterministic timestamp from the triggering event —
+// the core MUST NOT call time.Now() (doc §3.3).
+func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string, parentTimestamp int64) {
+	// Allocate a dedicated sequence for this derived event to avoid collision
+	liqSeq := c.sequence
+	c.sequence++
+
+	liquidationID, err := c.liquidationMgr.TriggerLiquidation(userID, marketID, liqSeq)
 	if err != nil {
 		// Already in liquidation or no position
 		return
@@ -538,25 +602,34 @@ func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string
 		LiquidationID: liquidationID,
 		UserID:        userID,
 		Market:        marketID,
-		Sequence:      c.sequence,
-		Timestamp:     time.Now().UnixMicro(), // Side-effect event — not replayed, only published outbound
+		Sequence:      liqSeq,
+		Timestamp:     parentTimestamp, // Deterministic: derived from parent event
 	}
+
+	// Compute state hash for this derived event
+	stateDigest := c.computeStateDigest(nil)
+	stateHash := c.hasher.ComputeHash(liqSeq, stateDigest)
 
 	// Emit to persist channel so it's recorded in the event log
 	output := CoreOutput{
 		Envelope: &event.EventEnvelope{
-			Sequence:       c.sequence,
+			Sequence:       liqSeq,
 			IdempotencyKey: triggerEvt.IdempotencyKey(),
 			EventType:      event.EventTypeLiquidationTriggered,
 			MarketID:       triggerEvt.MarketID(),
+			Timestamp:      time.UnixMicro(parentTimestamp),
+			StateHash:      stateHash,
+			PrevHash:       c.hasher.GetPrevHash(),
 		},
 	}
 
-	// Non-blocking send — if channel is full, log warning but don't block the core
+	// Blocking send — guarantees no event is lost (doc §12)
+	c.persistChan <- output
+
+	// Non-blocking projection send
 	select {
-	case c.persistChan <- output:
+	case c.projectionChan <- output:
 	default:
-		// Channel full — this is a backpressure signal
 	}
 }
 
@@ -698,6 +771,15 @@ func (c *DeterministicCore) handleFundingEpochSettle(evt *event.FundingEpochSett
 		if pos.MarketID == evt.Market && !pos.IsFlat() {
 			pos.LastFundingEpoch = evt.EpochID
 			pos.Version++
+		}
+	}
+
+	// POST-FUNDING MARGIN CHECK
+	// Per doc margin-check-triggers: FundingEpochSettle triggers margin checks
+	// for all affected users. Funding payments can reduce collateral below MM.
+	for _, pos := range allPositions {
+		if pos.MarketID == evt.Market && !pos.IsFlat() {
+			c.checkMarginForUser(pos.UserID, pos.MarketID, snapshot.Timestamp)
 		}
 	}
 
@@ -848,7 +930,7 @@ func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*
 	})
 
 	// Recompute margin for all positions in this market
-	c.checkMarginForMarket(evt.Market)
+	c.checkMarginForMarket(evt.Market, evt.Timestamp)
 
 	// Return empty batch (risk param updates don't generate journals)
 	return &ledger.Batch{
@@ -886,5 +968,95 @@ func (c *DeterministicCore) dispatchEvent(evt event.Event) (*ledger.Batch, error
 		return c.handleRiskParamUpdate(e)
 	default:
 		return nil, fmt.Errorf("unknown event type: %T", evt)
+	}
+}
+
+// --- Snapshot Restore & Startup Methods ---
+
+// SnapshotState holds the serializable in-memory state for restore.
+// This mirrors persistence.SnapshotData but uses typed fields.
+type SnapshotState struct {
+	Sequence          int64
+	StateHash         [32]byte
+	PrevHash          [32]byte
+	Balances          map[ledger.AccountKey]int64
+	Positions         []*state.Position
+	MarkPrices        map[string]*state.MarkPriceState
+	FundingSnapshots  map[string]*state.FundingSnapshot
+	FundingNextEpochs map[string]int64
+	SequenceState     map[string]int64
+	IdempotencyKeys   []string
+}
+
+// RestoreFromSnapshot restores the core's in-memory state from a snapshot.
+// Per doc §11: on warm restart, load latest snapshot then replay events.
+func (c *DeterministicCore) RestoreFromSnapshot(snap *SnapshotState) {
+	// Restore sequence
+	c.sequence = snap.Sequence + 1 // Next sequence to assign
+
+	// Restore state hash chain
+	c.hasher.SetPrevHash(snap.StateHash)
+
+	// Restore balances
+	for key, balance := range snap.Balances {
+		c.balanceTracker.SetBalance(key, balance)
+	}
+
+	// Restore positions
+	for _, pos := range snap.Positions {
+		c.positionManager.SetPosition(pos)
+	}
+
+	// Restore mark prices
+	for marketID, mp := range snap.MarkPrices {
+		c.positionManager.RestoreMarkPrice(marketID, mp)
+	}
+
+	// Restore funding state
+	for key, fs := range snap.FundingSnapshots {
+		_ = key // key is "market:epoch", already encoded in FundingSnapshot
+		c.fundingManager.RestoreSnapshot(fs)
+	}
+	for marketID, nextEpoch := range snap.FundingNextEpochs {
+		c.fundingManager.RestoreNextEpoch(marketID, nextEpoch)
+	}
+
+	// Restore sequence validator state
+	for partition, nextSeq := range snap.SequenceState {
+		c.sequenceValidator.RestorePartition(partition, nextSeq)
+	}
+
+	// Restore journal generator sequence
+	c.journalGen.SetSequence(snap.Sequence)
+}
+
+// WarmLRU loads recent idempotency keys into the LRU cache.
+// Per doc §10: avoids cold-path DB lookups for recently processed events.
+func (c *DeterministicCore) WarmLRU(keys []string) {
+	c.idempotency.lru.WarmFromKeys(keys)
+}
+
+// GetSequence returns the current global sequence number.
+func (c *DeterministicCore) GetSequence() int64 {
+	return c.sequence
+}
+
+// GetStateHash returns the current state hash (chain tip).
+func (c *DeterministicCore) GetStateHash() [32]byte {
+	return c.hasher.GetPrevHash()
+}
+
+// CreateSnapshotState captures the current in-memory state for persistence.
+func (c *DeterministicCore) CreateSnapshotState() *SnapshotState {
+	return &SnapshotState{
+		Sequence:          c.sequence - 1, // Last processed sequence
+		StateHash:         c.hasher.GetPrevHash(),
+		Balances:          c.balanceTracker.Snapshot(),
+		Positions:         c.positionManager.GetAllPositions(),
+		MarkPrices:        c.positionManager.GetAllMarkPrices(),
+		FundingSnapshots:  c.fundingManager.GetAllSnapshots(),
+		FundingNextEpochs: c.fundingManager.GetAllNextEpochs(),
+		SequenceState:     c.sequenceValidator.GetAllPartitions(),
+		IdempotencyKeys:   c.idempotency.lru.GetAllKeys(),
 	}
 }

@@ -87,6 +87,20 @@ func (sv *SequenceValidator) SetExpectedSequence(partition string, seq int64) {
 	sv.expectedNextSeq[partition] = seq
 }
 
+// RestorePartition is an alias for SetExpectedSequence (used for snapshot restore)
+func (sv *SequenceValidator) RestorePartition(partition string, nextSeq int64) {
+	sv.expectedNextSeq[partition] = nextSeq
+}
+
+// GetAllPartitions returns all partition sequence state (for snapshot creation)
+func (sv *SequenceValidator) GetAllPartitions() map[string]int64 {
+	result := make(map[string]int64, len(sv.expectedNextSeq))
+	for k, v := range sv.expectedNextSeq {
+		result[k] = v
+	}
+	return result
+}
+
 // --- Metrics ---
 
 // SequenceMetrics tracks sequence validation stats.

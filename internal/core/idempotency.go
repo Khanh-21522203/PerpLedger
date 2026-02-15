@@ -164,6 +164,16 @@ func (lru *IdempotencyLRU) Evictions() int64 {
 	return lru.evictions
 }
 
+// GetAllKeys returns all keys in the LRU (for snapshot creation)
+func (lru *IdempotencyLRU) GetAllKeys() []string {
+	keys := make([]string, 0, lru.lruList.Len())
+	for elem := lru.lruList.Back(); elem != nil; elem = elem.Prev() {
+		entry := elem.Value.(*lruEntry)
+		keys = append(keys, entry.key)
+	}
+	return keys
+}
+
 // --- Metrics ---
 
 // IdempotencyMetrics tracks dedup stats.

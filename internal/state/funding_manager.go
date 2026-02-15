@@ -67,3 +67,32 @@ func (fm *FundingManager) GetFundingSnapshot(marketID string, epochID int64) (*F
 	snap, ok := fm.snapshots[key]
 	return snap, ok
 }
+
+// RestoreSnapshot directly sets a funding snapshot (used for snapshot restore)
+func (fm *FundingManager) RestoreSnapshot(snap *FundingSnapshot) {
+	key := fmt.Sprintf("%s:%d", snap.MarketID, snap.EpochID)
+	fm.snapshots[key] = snap
+}
+
+// RestoreNextEpoch directly sets the next expected epoch (used for snapshot restore)
+func (fm *FundingManager) RestoreNextEpoch(marketID string, nextEpoch int64) {
+	fm.expectedNextEpoch[marketID] = nextEpoch
+}
+
+// GetAllSnapshots returns all funding snapshots (for snapshot creation)
+func (fm *FundingManager) GetAllSnapshots() map[string]*FundingSnapshot {
+	result := make(map[string]*FundingSnapshot, len(fm.snapshots))
+	for k, v := range fm.snapshots {
+		result[k] = v
+	}
+	return result
+}
+
+// GetAllNextEpochs returns all next epoch IDs (for snapshot creation)
+func (fm *FundingManager) GetAllNextEpochs() map[string]int64 {
+	result := make(map[string]int64, len(fm.expectedNextEpoch))
+	for k, v := range fm.expectedNextEpoch {
+		result[k] = v
+	}
+	return result
+}

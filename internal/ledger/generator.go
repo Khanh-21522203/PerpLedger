@@ -21,6 +21,16 @@ func NewJournalGenerator(startSequence int64, tracker *BalanceTracker) *JournalG
 	}
 }
 
+// SetSequence updates the generator's sequence (used for snapshot restore)
+func (jg *JournalGenerator) SetSequence(seq int64) {
+	jg.sequence = seq
+}
+
+// GetSequence returns the generator's current sequence
+func (jg *JournalGenerator) GetSequence() int64 {
+	return jg.sequence
+}
+
 // GenerateDepositInitiated creates journals for a pending deposit.
 // Moves funds: external:deposits → user:pending_deposit
 func (jg *JournalGenerator) GenerateDepositInitiated(
@@ -57,23 +67,41 @@ func (jg *JournalGenerator) GenerateDepositInitiated(
 }
 
 // GenerateDepositConfirmed creates journals for a confirmed deposit.
-// Moves funds: external:deposits → user:collateral
-// (If a pending deposit exists, it should be cleared separately.)
+// Two-phase deposit completion:
+//   1. Reverse the pending deposit: user:pending_deposit → external:deposits
+//   2. Credit user collateral:      user:collateral     ← external:deposits
 func (jg *JournalGenerator) GenerateDepositConfirmed(
 	evt *event.DepositConfirmed,
 	assetID AssetID,
 ) (*Batch, error) {
 	batchID := uuid.New()
+	ts := evt.Timestamp.UnixMicro()
 
 	batch := &Batch{
 		BatchID:   batchID,
 		EventRef:  evt.DepositID.String(),
 		Sequence:  jg.sequence,
-		Timestamp: evt.Timestamp.UnixMicro(),
-		Journals:  make([]Journal, 0, 1),
+		Timestamp: ts,
+		Journals:  make([]Journal, 0, 2),
 	}
 
-	journal := Journal{
+	// Journal 1: Clear pending deposit (reverse of DepositInitiated)
+	clearPending := Journal{
+		JournalID:     uuid.New(),
+		BatchID:       batchID,
+		EventRef:      evt.DepositID.String(),
+		Sequence:      jg.sequence,
+		DebitAccount:  NewExternalAccountKey(SubTypeExternalDeposits, assetID),
+		CreditAccount: NewUserAccountKey(evt.UserID, SubTypePendingDeposit, assetID),
+		AssetID:       assetID,
+		Amount:        evt.Amount,
+		JournalType:   JournalTypeDepositConfirm,
+		Timestamp:     ts,
+	}
+	batch.Journals = append(batch.Journals, clearPending)
+
+	// Journal 2: Credit user collateral
+	creditCollateral := Journal{
 		JournalID:     uuid.New(),
 		BatchID:       batchID,
 		EventRef:      evt.DepositID.String(),
@@ -83,10 +111,10 @@ func (jg *JournalGenerator) GenerateDepositConfirmed(
 		AssetID:       assetID,
 		Amount:        evt.Amount,
 		JournalType:   JournalTypeDepositConfirm,
-		Timestamp:     evt.Timestamp.UnixMicro(),
+		Timestamp:     ts,
 	}
+	batch.Journals = append(batch.Journals, creditCollateral)
 
-	batch.Journals = append(batch.Journals, journal)
 	jg.sequence++
 
 	return batch, nil

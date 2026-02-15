@@ -146,6 +146,11 @@ func (bt *BalanceTracker) ValidateNonNegative(key AccountKey) error {
 	return nil
 }
 
+// SetBalance sets the balance for an account directly (used for snapshot restore)
+func (bt *BalanceTracker) SetBalance(key AccountKey, balance int64) {
+	bt.balances[key] = balance
+}
+
 // Snapshot returns a copy of all balances (for state hashing)
 func (bt *BalanceTracker) Snapshot() map[AccountKey]int64 {
 	snapshot := make(map[AccountKey]int64, len(bt.balances))

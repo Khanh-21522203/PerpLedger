@@ -108,6 +108,79 @@ func NewExternalAccountKey(subType AccountSubType, assetID AssetID) AccountKey {
 	}
 }
 
+// ParseAccountPath reverses AccountPath() back into an AccountKey.
+// Used for snapshot restore where balances are stored as string paths.
+// Format: "user:<uuid>:<subtype>:<asset>" or "system:<subtype>:<asset>" or "external:<subtype>:<asset>"
+func ParseAccountPath(path string) AccountKey {
+	var key AccountKey
+	parts := splitPath(path)
+	if len(parts) < 3 {
+		return key
+	}
+
+	switch parts[0] {
+	case "user":
+		key.Scope = AccountScopeUser
+		if len(parts) >= 4 {
+			uid, _ := uuid.Parse(parts[1])
+			key.EntityID = uid
+			key.SubType = parseSubType(parts[2])
+			key.AssetID, _ = GetAssetID(parts[3])
+		}
+	case "system":
+		key.Scope = AccountScopeSystem
+		key.SubType = parseSubType(parts[1])
+		key.AssetID, _ = GetAssetID(parts[2])
+	case "external":
+		key.Scope = AccountScopeExternal
+		key.SubType = parseSubType(parts[1])
+		key.AssetID, _ = GetAssetID(parts[2])
+	}
+	return key
+}
+
+func splitPath(path string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(path); i++ {
+		if path[i] == ':' {
+			parts = append(parts, path[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, path[start:])
+	return parts
+}
+
+func parseSubType(name string) AccountSubType {
+	switch name {
+	case "collateral":
+		return SubTypeCollateral
+	case "reserved":
+		return SubTypeReserved
+	case "pending_deposit":
+		return SubTypePendingDeposit
+	case "pending_withdrawal":
+		return SubTypePendingWithdrawal
+	case "funding_accrual":
+		return SubTypeFundingAccrual
+	case "pnl":
+		return SubTypePnL
+	case "fees":
+		return SubTypeSystemFees
+	case "funding_pool":
+		return SubTypeSystemFundingPool
+	case "insurance_fund":
+		return SubTypeSystemInsuranceFund
+	case "deposits":
+		return SubTypeExternalDeposits
+	case "withdrawals":
+		return SubTypeExternalWithdrawals
+	default:
+		return SubTypeCollateral
+	}
+}
+
 // AccountPath returns the string representation for storage/logging
 func (k AccountKey) AccountPath() string {
 	assetName, _ := GetAssetName(k.AssetID)

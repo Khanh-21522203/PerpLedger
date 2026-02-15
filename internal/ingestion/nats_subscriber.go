@@ -159,6 +159,14 @@ func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
 			MaxAge:    72 * time.Hour,
 			Replicas:  1,
 		},
+		{
+			Name:      "PERP_RISK",
+			Subjects:  []string{"perp.risk.>"},
+			Storage:   jetstream.FileStorage,
+			Retention: jetstream.LimitsPolicy,
+			MaxAge:    72 * time.Hour,
+			Replicas:  1,
+		},
 	}
 
 	for _, cfg := range streams {

@@ -48,3 +48,8 @@ func (h *StateHasher) ComputeHash(sequence int64, stateDigest []byte) [32]byte {
 func (h *StateHasher) GetPrevHash() [32]byte {
 	return h.prevHash
 }
+
+// SetPrevHash restores the chain tip from a snapshot
+func (h *StateHasher) SetPrevHash(hash [32]byte) {
+	h.prevHash = hash
+}

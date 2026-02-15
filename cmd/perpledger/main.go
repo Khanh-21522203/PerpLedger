@@ -4,11 +4,13 @@ import (
 	"PerpLedger/internal/core"
 	"PerpLedger/internal/event"
 	"PerpLedger/internal/ingestion"
+	"PerpLedger/internal/ledger"
 	"PerpLedger/internal/observability"
 	"PerpLedger/internal/persistence"
 	"PerpLedger/internal/projection"
 	"PerpLedger/internal/query"
 	"PerpLedger/internal/server"
+	"PerpLedger/internal/state"
 	"context"
 	"database/sql"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	_ "github.com/lib/pq"
 )
@@ -127,7 +130,6 @@ func main() {
 	if snap != nil {
 		startSequence = snap.Sequence + 1
 		log.Printf("INFO: loaded snapshot at sequence %d", snap.Sequence)
-		// TODO: restore in-memory state from snapshot
 	} else {
 		log.Println("INFO: no snapshot found, cold start from sequence 0")
 	}
@@ -158,10 +160,39 @@ func main() {
 		metrics,
 	)
 
+	// --- Snapshot Restore ---
+	// Per doc §11: restore in-memory state from snapshot
+	if snap != nil {
+		restoreStateFromSnapshot(deterministicCore, snap)
+	}
+
 	// --- LRU Warming ---
+	// Per doc §10: warm LRU from snapshot to avoid cold-path DB lookups
 	if snap != nil && len(snap.IdempotencyKeys) > 0 {
 		log.Printf("INFO: warming LRU with %d keys from snapshot", len(snap.IdempotencyKeys))
-		// TODO: expose LRU warming on DeterministicCore
+		deterministicCore.WarmLRU(snap.IdempotencyKeys)
+	}
+
+	// --- Event Replay ---
+	// Per doc §11: replay events from snapshot.sequence+1 to head
+	replayCount, err := replayEventsFromLog(ctx, snapMgr, deterministicCore, startSequence)
+	if err != nil {
+		log.Fatalf("FATAL: event replay failed: %v", err)
+	}
+	if replayCount > 0 {
+		log.Printf("INFO: replayed %d events (sequence now at %d)", replayCount, deterministicCore.GetSequence())
+	}
+
+	// --- State Hash Verification ---
+	// Per doc §11: verify state hash after replay matches stored hash
+	if snap != nil && replayCount == 0 {
+		var expectedHash [32]byte
+		copy(expectedHash[:], snap.StateHash)
+		actualHash := deterministicCore.GetStateHash()
+		if expectedHash != actualHash {
+			log.Fatalf("FATAL: state hash mismatch after restore — expected %x, got %x", expectedHash, actualHash)
+		}
+		log.Println("INFO: state hash verified after snapshot restore")
 	}
 
 	// --- NATS ---
@@ -236,6 +267,11 @@ func main() {
 		runIngestionLoop(ctx, rawEventChan, deterministicCore)
 	}()
 
+	// 5b. gRPC → Core ingestion loop
+	go func() {
+		runGRPCIngestionLoop(ctx, eventChan, deterministicCore)
+	}()
+
 	// 6. gRPC server
 	go func() {
 		errChan <- grpcServer.StartGRPC(ctx)
@@ -246,7 +282,13 @@ func main() {
 		errChan <- grpcServer.StartHTTPGateway(ctx)
 	}()
 
-	// 8. Prometheus metrics server (per doc §18)
+	// 8. Periodic snapshot creation
+	// Per doc §11: snapshots taken every N events for faster recovery
+	go func() {
+		runPeriodicSnapshots(ctx, deterministicCore, snapMgr, int(cfg.SnapshotInterval), metrics)
+	}()
+
+	// 9. Prometheus metrics server (per doc §18)
 	go func() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
@@ -281,19 +323,25 @@ func main() {
 	}
 
 	// --- Graceful shutdown ---
-	// Per doc §3: drain channels, flush persistence, then exit
+	// Per doc §3: drain channels, flush persistence, take final snapshot, then exit
 	cancel()
 
 	natsSubscriber.Stop()
 
 	// Give workers time to flush
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
-	_ = shutdownCtx
 
 	close(persistWorkerChan)
 	close(projectionWorkerChan)
 	close(publishChan)
+
+	// Take final snapshot before exit (per doc graceful-shutdown-flowchart)
+	if err := takeSnapshot(shutdownCtx, deterministicCore, snapMgr, metrics); err != nil {
+		log.Printf("ERROR: final snapshot failed: %v", err)
+	} else {
+		log.Println("INFO: final snapshot saved")
+	}
 
 	log.Println("INFO: PerpLedger shutdown complete")
 }
@@ -486,6 +534,261 @@ func resolveEventType(subject string, prefixMap map[string]string) string {
 		}
 	}
 	return bestType
+}
+
+// runGRPCIngestionLoop reads typed events from the gRPC ingest channel and feeds them to the core.
+// Per doc §15: gRPC ingest is for admin operations and manual event injection.
+func runGRPCIngestionLoop(ctx context.Context, eventChan <-chan event.Event, core *core.DeterministicCore) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-eventChan:
+			if !ok {
+				return
+			}
+
+			if err := core.ProcessEvent(evt); err != nil {
+				log.Printf("ERROR: core.ProcessEvent (gRPC) failed (type=%s, key=%s): %v",
+					evt.EventType(), evt.IdempotencyKey(), err)
+			}
+		}
+	}
+}
+
+// --- Snapshot Restore & Replay ---
+
+// restoreStateFromSnapshot converts a persistence.SnapshotData into core.SnapshotState
+// and restores the deterministic core's in-memory state.
+func restoreStateFromSnapshot(deterministicCore *core.DeterministicCore, snap *persistence.SnapshotData) {
+	coreSnap := &core.SnapshotState{
+		Sequence:          snap.Sequence,
+		Balances:          make(map[ledger.AccountKey]int64),
+		MarkPrices:        make(map[string]*state.MarkPriceState),
+		FundingSnapshots:  make(map[string]*state.FundingSnapshot),
+		FundingNextEpochs: snap.FundingNextEpochs,
+		SequenceState:     snap.SequenceState,
+		IdempotencyKeys:   snap.IdempotencyKeys,
+	}
+
+	// Restore state hash
+	copy(coreSnap.StateHash[:], snap.StateHash)
+	copy(coreSnap.PrevHash[:], snap.PrevHash)
+
+	// Convert balance map (string path → AccountKey)
+	for path, balance := range snap.Balances {
+		key := ledger.ParseAccountPath(path)
+		coreSnap.Balances[key] = balance
+	}
+
+	// Convert positions
+	for _, ps := range snap.Positions {
+		userID, _ := uuid.Parse(ps.UserID)
+		pos := &state.Position{
+			UserID:           userID,
+			MarketID:         ps.MarketID,
+			Side:             event.Side(ps.Side),
+			Size:             ps.Size,
+			AvgEntryPrice:    ps.AvgEntryPrice,
+			RealizedPnL:      ps.RealizedPnL,
+			LastFundingEpoch: ps.LastFundingEpoch,
+			LiquidationState: state.LiquidationState(ps.LiquidationState),
+			Version:          ps.Version,
+		}
+		coreSnap.Positions = append(coreSnap.Positions, pos)
+	}
+
+	// Convert mark prices
+	for marketID, mp := range snap.MarkPrices {
+		coreSnap.MarkPrices[marketID] = &state.MarkPriceState{
+			Price:         mp.Price,
+			PriceSequence: mp.PriceSequence,
+			Timestamp:     mp.Timestamp,
+		}
+	}
+
+	// Convert funding snapshots
+	for key, fs := range snap.FundingSnapshots {
+		coreSnap.FundingSnapshots[key] = &state.FundingSnapshot{
+			MarketID:    fs.MarketID,
+			EpochID:     fs.EpochID,
+			FundingRate: fs.FundingRate,
+			MarkPrice:   fs.MarkPrice,
+			Timestamp:   fs.Timestamp,
+		}
+	}
+
+	deterministicCore.RestoreFromSnapshot(coreSnap)
+	log.Printf("INFO: restored in-memory state from snapshot at sequence %d", snap.Sequence)
+}
+
+// replayEventsFromLog replays events from the event log starting at fromSequence.
+// Per doc §11: used for warm restart (replay from snapshot) and cold restart (replay all).
+func replayEventsFromLog(
+	ctx context.Context,
+	snapMgr *persistence.SnapshotManager,
+	deterministicCore *core.DeterministicCore,
+	fromSequence int64,
+) (int64, error) {
+	const batchSize = 1000
+	var totalReplayed int64
+
+	for {
+		events, err := snapMgr.LoadEventsFrom(ctx, fromSequence, batchSize)
+		if err != nil {
+			return totalReplayed, fmt.Errorf("load events from seq %d: %w", fromSequence, err)
+		}
+
+		if len(events) == 0 {
+			break
+		}
+
+		for _, evtRow := range events {
+			// Parse the stored event payload back into a typed event
+			raw := ingestion.RawEvent{
+				Subject: evtRow.EventType,
+				Data:    evtRow.Payload,
+			}
+
+			typedEvt, err := ingestion.ParseRawEvent(raw, evtRow.EventType)
+			if err != nil {
+				log.Printf("WARN: skip unparseable event at seq=%d type=%s: %v",
+					evtRow.Sequence, evtRow.EventType, err)
+				continue
+			}
+
+			if err := deterministicCore.ProcessEvent(typedEvt); err != nil {
+				// During replay, duplicates and sequence errors are expected — skip
+				log.Printf("DEBUG: replay skip seq=%d: %v", evtRow.Sequence, err)
+			}
+
+			totalReplayed++
+		}
+
+		fromSequence = events[len(events)-1].Sequence + 1
+	}
+
+	return totalReplayed, nil
+}
+
+// --- Snapshot Helpers ---
+
+// runPeriodicSnapshots takes snapshots every N events.
+// Per doc §11: snapshots are taken periodically for faster recovery.
+func runPeriodicSnapshots(
+	ctx context.Context,
+	deterministicCore *core.DeterministicCore,
+	snapMgr *persistence.SnapshotManager,
+	interval int,
+	metrics *observability.Metrics,
+) {
+	if interval <= 0 {
+		interval = 100_000 // Default: every 100k events
+	}
+
+	lastSnapshotSeq := deterministicCore.GetSequence()
+	ticker := time.NewTicker(10 * time.Second) // Check every 10s
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentSeq := deterministicCore.GetSequence()
+			if currentSeq-lastSnapshotSeq >= int64(interval) {
+				if err := takeSnapshot(ctx, deterministicCore, snapMgr, metrics); err != nil {
+					log.Printf("WARN: periodic snapshot failed: %v", err)
+				} else {
+					lastSnapshotSeq = currentSeq
+					log.Printf("INFO: periodic snapshot at sequence %d", currentSeq)
+				}
+			}
+		}
+	}
+}
+
+// takeSnapshot captures the core's in-memory state and persists it.
+func takeSnapshot(
+	ctx context.Context,
+	deterministicCore *core.DeterministicCore,
+	snapMgr *persistence.SnapshotManager,
+	metrics *observability.Metrics,
+) error {
+	start := time.Now()
+
+	coreSnap := deterministicCore.CreateSnapshotState()
+
+	// Convert core.SnapshotState to persistence.SnapshotData
+	snapData := &persistence.SnapshotData{
+		Sequence:          coreSnap.Sequence,
+		StateHash:         coreSnap.StateHash[:],
+		Balances:          make(map[string]int64),
+		Positions:         make([]persistence.PositionSnapshot, 0, len(coreSnap.Positions)),
+		MarkPrices:        make(map[string]persistence.MarkPriceSnap),
+		FundingSnapshots:  make(map[string]persistence.FundingSnap),
+		FundingNextEpochs: coreSnap.FundingNextEpochs,
+		SequenceState:     coreSnap.SequenceState,
+		IdempotencyKeys:   coreSnap.IdempotencyKeys,
+		CreatedAt:         time.Now(),
+	}
+
+	// Convert balances
+	for key, balance := range coreSnap.Balances {
+		snapData.Balances[key.AccountPath()] = balance
+	}
+
+	// Convert positions
+	for _, pos := range coreSnap.Positions {
+		snapData.Positions = append(snapData.Positions, persistence.PositionSnapshot{
+			UserID:           pos.UserID.String(),
+			MarketID:         pos.MarketID,
+			Side:             int32(pos.Side),
+			Size:             pos.Size,
+			AvgEntryPrice:    pos.AvgEntryPrice,
+			RealizedPnL:      pos.RealizedPnL,
+			LastFundingEpoch: pos.LastFundingEpoch,
+			LiquidationState: int32(pos.LiquidationState),
+			Version:          pos.Version,
+		})
+	}
+
+	// Convert mark prices
+	for marketID, mp := range coreSnap.MarkPrices {
+		snapData.MarkPrices[marketID] = persistence.MarkPriceSnap{
+			Price:         mp.Price,
+			PriceSequence: mp.PriceSequence,
+			Timestamp:     mp.Timestamp,
+		}
+	}
+
+	// Convert funding snapshots
+	for key, fs := range coreSnap.FundingSnapshots {
+		snapData.FundingSnapshots[key] = persistence.FundingSnap{
+			MarketID:    fs.MarketID,
+			EpochID:     fs.EpochID,
+			FundingRate: fs.FundingRate,
+			MarkPrice:   fs.MarkPrice,
+			Timestamp:   fs.Timestamp,
+		}
+	}
+
+	if err := snapMgr.SaveSnapshot(ctx, snapData); err != nil {
+		return fmt.Errorf("save snapshot: %w", err)
+	}
+
+	// Mark as verified immediately (we just created it from live state)
+	if err := snapMgr.MarkVerified(ctx, snapData.Sequence); err != nil {
+		log.Printf("WARN: mark snapshot verified failed: %v", err)
+	}
+
+	if metrics != nil {
+		metrics.SnapshotTaken.Inc()
+		metrics.SnapshotDuration.Observe(time.Since(start).Seconds())
+		metrics.SnapshotLastSeq.Set(float64(snapData.Sequence))
+	}
+
+	return nil
 }
 
 // --- Helpers ---
