@@ -63,14 +63,14 @@ func (pm *PositionManager) GetOrCreatePosition(userID uuid.UUID, marketID string
 }
 
 // UpdateMarkPrice processes a mark price update
-func (pm *PositionManager) UpdateMarkPrice(marketID string, price int64, sequence int64, timestamp int64) error {
+func (pm *PositionManager) UpdateMarkPrice(marketID string, price int64, sequence int64, timestamp int64) (bool, error) {
 	current := pm.markPrices[marketID]
 
 	if current != nil {
 		// Check sequence ordering
 		if sequence <= current.PriceSequence {
 			// Stale or duplicate - silently ignore (idempotent)
-			return nil
+			return false, nil
 		}
 
 		if sequence > current.PriceSequence+1 {
@@ -85,7 +85,7 @@ func (pm *PositionManager) UpdateMarkPrice(marketID string, price int64, sequenc
 		Timestamp:     timestamp,
 	}
 
-	return nil
+	return true, nil
 }
 
 // GetMarkPrice returns current mark price for a market

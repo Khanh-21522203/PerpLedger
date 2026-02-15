@@ -32,7 +32,8 @@ func (jg *JournalGenerator) GetSequence() int64 {
 }
 
 // GenerateDepositInitiated creates journals for a pending deposit.
-// Moves funds: external:deposits → user:pending_deposit
+// Per flow deposit-withdrawal-lifecycle-sequence:
+// Moves funds: external:deposits → system:pending_deposits
 func (jg *JournalGenerator) GenerateDepositInitiated(
 	evt *event.DepositInitiated,
 	assetID AssetID,
@@ -52,7 +53,7 @@ func (jg *JournalGenerator) GenerateDepositInitiated(
 		BatchID:       batchID,
 		EventRef:      evt.DepositID.String(),
 		Sequence:      jg.sequence,
-		DebitAccount:  NewUserAccountKey(evt.UserID, SubTypePendingDeposit, assetID),
+		DebitAccount:  NewSystemAccountKey("deposits", SubTypeSystemPendingDeposits, assetID),
 		CreditAccount: NewExternalAccountKey(SubTypeExternalDeposits, assetID),
 		AssetID:       assetID,
 		Amount:        evt.Amount,
@@ -67,9 +68,9 @@ func (jg *JournalGenerator) GenerateDepositInitiated(
 }
 
 // GenerateDepositConfirmed creates journals for a confirmed deposit.
-// Two-phase deposit completion:
-//   1. Reverse the pending deposit: user:pending_deposit → external:deposits
-//   2. Credit user collateral:      user:collateral     ← external:deposits
+// Per flow deposit-withdrawal-lifecycle-sequence:
+//   1. Reverse the pending deposit: system:pending_deposits → external:deposits
+//   2. Credit user collateral:      user:collateral         ← external:deposits
 func (jg *JournalGenerator) GenerateDepositConfirmed(
 	evt *event.DepositConfirmed,
 	assetID AssetID,
@@ -92,7 +93,7 @@ func (jg *JournalGenerator) GenerateDepositConfirmed(
 		EventRef:      evt.DepositID.String(),
 		Sequence:      jg.sequence,
 		DebitAccount:  NewExternalAccountKey(SubTypeExternalDeposits, assetID),
-		CreditAccount: NewUserAccountKey(evt.UserID, SubTypePendingDeposit, assetID),
+		CreditAccount: NewSystemAccountKey("deposits", SubTypeSystemPendingDeposits, assetID),
 		AssetID:       assetID,
 		Amount:        evt.Amount,
 		JournalType:   JournalTypeDepositConfirm,
@@ -144,13 +145,13 @@ func (jg *JournalGenerator) GenerateWithdrawalRequested(
 		Journals:  make([]Journal, 0, 1),
 	}
 
-	// Lock funds: user:collateral -> user:pending_withdrawal
+	// Lock funds: user:collateral -> system:pending_withdrawals
 	journal := Journal{
 		JournalID:     uuid.New(),
 		BatchID:       batchID,
 		EventRef:      withdrawalID.String(),
 		Sequence:      jg.sequence,
-		DebitAccount:  NewUserAccountKey(userID, SubTypePendingWithdrawal, assetID),
+		DebitAccount:  NewSystemAccountKey("withdrawals", SubTypeSystemPendingWithdrawals, assetID),
 		CreditAccount: NewUserAccountKey(userID, SubTypeCollateral, assetID),
 		AssetID:       assetID,
 		Amount:        amount,
@@ -182,14 +183,14 @@ func (jg *JournalGenerator) GenerateWithdrawalConfirmed(
 		Journals:  make([]Journal, 0, 1),
 	}
 
-	// Finalize: user:pending_withdrawal -> external:withdrawals
+	// Finalize: system:pending_withdrawals -> external:withdrawals
 	journal := Journal{
 		JournalID:     uuid.New(),
 		BatchID:       batchID,
 		EventRef:      withdrawalID.String(),
 		Sequence:      jg.sequence,
 		DebitAccount:  NewExternalAccountKey(SubTypeExternalWithdrawals, assetID),
-		CreditAccount: NewUserAccountKey(userID, SubTypePendingWithdrawal, assetID),
+		CreditAccount: NewSystemAccountKey("withdrawals", SubTypeSystemPendingWithdrawals, assetID),
 		AssetID:       assetID,
 		Amount:        amount,
 		JournalType:   JournalTypeWithdrawalConfirm,
@@ -220,14 +221,14 @@ func (jg *JournalGenerator) GenerateWithdrawalRejected(
 		Journals:  make([]Journal, 0, 1),
 	}
 
-	// Reverse: user:pending_withdrawal -> user:collateral
+	// Reverse: system:pending_withdrawals -> user:collateral
 	journal := Journal{
 		JournalID:     uuid.New(),
 		BatchID:       batchID,
 		EventRef:      withdrawalID.String(),
 		Sequence:      jg.sequence,
 		DebitAccount:  NewUserAccountKey(userID, SubTypeCollateral, assetID),
-		CreditAccount: NewUserAccountKey(userID, SubTypePendingWithdrawal, assetID),
+		CreditAccount: NewSystemAccountKey("withdrawals", SubTypeSystemPendingWithdrawals, assetID),
 		AssetID:       assetID,
 		Amount:        amount,
 		JournalType:   JournalTypeWithdrawalReject,
@@ -317,27 +318,27 @@ func (jg *JournalGenerator) GenerateTradeFill(
 	if realizedPnL != 0 {
 		var pnlJournal Journal
 		if realizedPnL > 0 {
-			// Profit: debit user:collateral, credit user:pnl
+			// Profit: debit user:collateral, credit system:pnl_clearing
 			pnlJournal = Journal{
 				JournalID:     uuid.New(),
 				BatchID:       batchID,
 				EventRef:      fillID.String(),
 				Sequence:      jg.sequence,
 				DebitAccount:  NewUserAccountKey(userID, SubTypeCollateral, quoteAssetID),
-				CreditAccount: NewUserAccountKey(userID, SubTypePnL, quoteAssetID),
+				CreditAccount: NewSystemAccountKey(marketID, SubTypeSystemPnLClearing, quoteAssetID),
 				AssetID:       quoteAssetID,
 				Amount:        realizedPnL,
 				JournalType:   JournalTypeTradePnL,
 				Timestamp:     timestamp,
 			}
 		} else {
-			// Loss: debit user:pnl, credit user:collateral
+			// Loss: debit system:pnl_clearing, credit user:collateral
 			pnlJournal = Journal{
 				JournalID:     uuid.New(),
 				BatchID:       batchID,
 				EventRef:      fillID.String(),
 				Sequence:      jg.sequence,
-				DebitAccount:  NewUserAccountKey(userID, SubTypePnL, quoteAssetID),
+				DebitAccount:  NewSystemAccountKey(marketID, SubTypeSystemPnLClearing, quoteAssetID),
 				CreditAccount: NewUserAccountKey(userID, SubTypeCollateral, quoteAssetID),
 				AssetID:       quoteAssetID,
 				Amount:        -realizedPnL, // Convert to positive

@@ -139,6 +139,7 @@ func main() {
 	// Per doc §12: persist channel blocks (backpressure), projection channel drops
 	persistCoreChan := make(chan core.CoreOutput, cfg.PersistChanSize)
 	projectionCoreChan := make(chan core.CoreOutput, cfg.ProjectionChanSize)
+	publishCoreChan := make(chan core.CoreOutput, 4096) // Outbound events for external consumers
 
 	// Bridge channels for persistence worker (avoids import cycle)
 	persistWorkerChan := make(chan persistence.CoreOutput, cfg.PersistChanSize)
@@ -157,6 +158,7 @@ func main() {
 		startSequence,
 		persistCoreChan,
 		projectionCoreChan,
+		publishCoreChan,
 		dbChecker,
 		metrics,
 	)
@@ -260,7 +262,7 @@ func main() {
 
 	// 4. Core output bridge: core.CoreOutput → persistence.CoreOutput + projection.ProjectionOutput
 	go func() {
-		bridgeCoreOutputs(ctx, persistCoreChan, projectionCoreChan, persistWorkerChan, projectionWorkerChan, publishChan)
+		bridgeCoreOutputs(ctx, persistCoreChan, projectionCoreChan, publishCoreChan, persistWorkerChan, projectionWorkerChan, publishChan)
 	}()
 
 	// 5. NATS → Core ingestion loop
@@ -349,10 +351,13 @@ func main() {
 
 // bridgeCoreOutputs converts core.CoreOutput to persistence and projection formats.
 // This avoids import cycles between core and persistence/projection packages.
+// publishIn carries outbound-only events (LiquidationTriggered, ReduceOnlyMode)
+// that must reach external consumers via the NATS outbound publisher.
 func bridgeCoreOutputs(
 	ctx context.Context,
 	persistIn <-chan core.CoreOutput,
 	projectionIn <-chan core.CoreOutput,
+	publishIn <-chan core.CoreOutput,
 	persistOut chan<- persistence.CoreOutput,
 	projectionOut chan<- projection.ProjectionOutput,
 	publishOut chan<- ingestion.PublishableEvent,
@@ -361,6 +366,30 @@ func bridgeCoreOutputs(
 		select {
 		case <-ctx.Done():
 			return
+
+		case output, ok := <-publishIn:
+			if !ok {
+				return
+			}
+			// Forward outbound-only events (LiquidationTriggered, ReduceOnlyMode)
+			// directly to the publish channel for external consumers.
+			var marketID *string
+			if output.Envelope.MarketID != nil {
+				s := *output.Envelope.MarketID
+				marketID = &s
+			}
+			select {
+			case publishOut <- ingestion.PublishableEvent{
+				Sequence:       output.Envelope.Sequence,
+				EventType:      output.Envelope.EventType.String(),
+				IdempotencyKey: output.Envelope.IdempotencyKey,
+				MarketID:       marketID,
+				Payload:        output.Batch,
+				StateHash:      output.Envelope.StateHash[:],
+				Timestamp:      output.Envelope.Timestamp,
+			}:
+			default:
+			}
 
 		case output, ok := <-persistIn:
 			if !ok {

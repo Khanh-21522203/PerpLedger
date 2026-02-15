@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // Executor abstracts *sql.DB and *sql.Tx so writers can operate within a transaction.
@@ -14,10 +15,9 @@ type Executor interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
-// EventLogWriter writes events and journals to Postgres using batch inserts.
-// Per doc §11: the persistence worker uses COPY protocol for high throughput.
-// This implementation uses multi-row INSERT as a portable alternative;
-// switch to pgx CopyFrom for production-grade throughput.
+// EventLogWriter writes events and journals to Postgres using COPY protocol.
+// Per doc §11 / flow persistence-worker-batching-flowchart: the persistence
+// worker uses Postgres COPY protocol for high throughput batch writes.
 type EventLogWriter struct {
 	db           *sql.DB
 	batchSize    int
@@ -66,80 +66,133 @@ func NewEventLogWriter(db *sql.DB, batchSize int, flushTimeout time.Duration) *E
 	}
 }
 
-// WriteEventBatch writes a batch of events to event_log.events using multi-row INSERT.
+// WriteEventBatch writes a batch of events to event_log.events using COPY protocol.
+// Per flow persistence-worker-batching-flowchart: uses Postgres COPY for high throughput.
 // Pass a *sql.Tx to run inside a transaction, or nil to use the writer's default *sql.DB.
 func (w *EventLogWriter) WriteEventBatch(ctx context.Context, events []EventRow, exec ...Executor) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	// Build multi-row INSERT
-	query := `INSERT INTO event_log.events 
-		(sequence, event_type, idempotency_key, market_id, payload, state_hash, prev_hash, timestamp, source_sequence)
-		VALUES `
-
-	values := make([]string, 0, len(events))
-	args := make([]interface{}, 0, len(events)*9)
-
-	for i, e := range events {
-		base := i * 9
-		values = append(values, fmt.Sprintf(
-			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9,
-		))
-		args = append(args,
-			e.Sequence, e.EventType, e.IdempotencyKey, e.MarketID,
-			e.Payload, e.StateHash, e.PrevHash, e.Timestamp, e.SourceSequence,
-		)
-	}
-
-	query += strings.Join(values, ", ")
-	query += " ON CONFLICT (sequence) DO NOTHING" // Idempotent writes
-
 	var e Executor = w.db
 	if len(exec) > 0 && exec[0] != nil {
 		e = exec[0]
 	}
-	_, err := e.ExecContext(ctx, query, args...)
-	return err
+
+	stmt, err := e.(interface {
+		Prepare(query string) (*sql.Stmt, error)
+	}).Prepare(pq.CopyIn("event_log.events",
+		"sequence", "event_type", "idempotency_key", "market_id",
+		"payload", "state_hash", "prev_hash", "timestamp", "source_sequence",
+	))
+	if err != nil {
+		// Fallback to multi-row INSERT if COPY not supported (e.g., in tests)
+		return w.writeEventBatchInsert(ctx, events, e)
+	}
+	defer stmt.Close()
+
+	for _, ev := range events {
+		_, err := stmt.Exec(
+			ev.Sequence, ev.EventType, ev.IdempotencyKey, ev.MarketID,
+			ev.Payload, ev.StateHash, ev.PrevHash, ev.Timestamp, ev.SourceSequence,
+		)
+		if err != nil {
+			return fmt.Errorf("COPY event row seq=%d: %w", ev.Sequence, err)
+		}
+	}
+
+	// Flush COPY buffer
+	_, err = stmt.Exec()
+	if err != nil {
+		return fmt.Errorf("COPY events flush: %w", err)
+	}
+
+	return nil
 }
 
-// WriteJournalBatch writes a batch of journal entries to event_log.journal.
+// writeEventBatchInsert is the fallback multi-row INSERT for environments
+// where COPY protocol is not available (e.g., certain test harnesses).
+func (w *EventLogWriter) writeEventBatchInsert(ctx context.Context, events []EventRow, e Executor) error {
+	for _, ev := range events {
+		_, err := e.ExecContext(ctx,
+			`INSERT INTO event_log.events
+				(sequence, event_type, idempotency_key, market_id, payload, state_hash, prev_hash, timestamp, source_sequence)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (sequence) DO NOTHING`,
+			ev.Sequence, ev.EventType, ev.IdempotencyKey, ev.MarketID,
+			ev.Payload, ev.StateHash, ev.PrevHash, ev.Timestamp, ev.SourceSequence,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteJournalBatch writes a batch of journal entries to event_log.journal using COPY protocol.
+// Per flow persistence-worker-batching-flowchart: uses Postgres COPY for high throughput.
 // Pass a *sql.Tx to run inside a transaction, or nil to use the writer's default *sql.DB.
 func (w *EventLogWriter) WriteJournalBatch(ctx context.Context, journals []JournalRow, exec ...Executor) error {
 	if len(journals) == 0 {
 		return nil
 	}
 
-	query := `INSERT INTO event_log.journal
-		(journal_id, batch_id, event_ref, sequence, debit_account, credit_account, asset_id, amount, journal_type, timestamp)
-		VALUES `
-
-	values := make([]string, 0, len(journals))
-	args := make([]interface{}, 0, len(journals)*10)
-
-	for i, j := range journals {
-		base := i * 10
-		values = append(values, fmt.Sprintf(
-			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-		))
-		args = append(args,
-			j.JournalID, j.BatchID, j.EventRef, j.Sequence,
-			j.DebitAccount, j.CreditAccount, j.AssetID, j.Amount,
-			j.JournalType, j.Timestamp,
-		)
-	}
-
-	query += strings.Join(values, ", ")
-	query += " ON CONFLICT (journal_id) DO NOTHING"
-
 	var e Executor = w.db
 	if len(exec) > 0 && exec[0] != nil {
 		e = exec[0]
 	}
-	_, err := e.ExecContext(ctx, query, args...)
-	return err
+
+	stmt, err := e.(interface {
+		Prepare(query string) (*sql.Stmt, error)
+	}).Prepare(pq.CopyIn("event_log.journal",
+		"journal_id", "batch_id", "event_ref", "sequence",
+		"debit_account", "credit_account", "asset_id", "amount",
+		"journal_type", "timestamp",
+	))
+	if err != nil {
+		// Fallback to row-by-row INSERT if COPY not supported
+		return w.writeJournalBatchInsert(ctx, journals, e)
+	}
+	defer stmt.Close()
+
+	for _, j := range journals {
+		_, err := stmt.Exec(
+			j.JournalID, j.BatchID, j.EventRef, j.Sequence,
+			j.DebitAccount, j.CreditAccount, j.AssetID, j.Amount,
+			j.JournalType, j.Timestamp,
+		)
+		if err != nil {
+			return fmt.Errorf("COPY journal row %s: %w", j.JournalID, err)
+		}
+	}
+
+	// Flush COPY buffer
+	_, err = stmt.Exec()
+	if err != nil {
+		return fmt.Errorf("COPY journals flush: %w", err)
+	}
+
+	return nil
+}
+
+// writeJournalBatchInsert is the fallback row-by-row INSERT for environments
+// where COPY protocol is not available.
+func (w *EventLogWriter) writeJournalBatchInsert(ctx context.Context, journals []JournalRow, e Executor) error {
+	for _, j := range journals {
+		_, err := e.ExecContext(ctx,
+			`INSERT INTO event_log.journal
+				(journal_id, batch_id, event_ref, sequence, debit_account, credit_account, asset_id, amount, journal_type, timestamp)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (journal_id) DO NOTHING`,
+			j.JournalID, j.BatchID, j.EventRef, j.Sequence,
+			j.DebitAccount, j.CreditAccount, j.AssetID, j.Amount,
+			j.JournalType, j.Timestamp,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateSchema is deprecated — use Migrator.Up() with migrations/*.sql instead.

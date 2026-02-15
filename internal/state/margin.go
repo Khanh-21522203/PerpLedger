@@ -2,6 +2,7 @@ package state
 
 import (
 	"PerpLedger/internal/ledger"
+	"math"
 
 	"github.com/google/uuid"
 )
@@ -142,7 +143,9 @@ func (mc *MarginCalculator) ComputeMarginFraction(
 	totalNotional := mc.ComputeTotalNotional(userID)
 
 	if totalNotional == 0 {
-		return 1_000_000 // 100% (no positions)
+		// Per flow margin-computation-flowchart: no positions → margin_fraction = MAX_INT
+		// This ensures the user is always Healthy when they have no exposure.
+		return math.MaxInt64
 	}
 
 	// margin_fraction = effective / notional (as fixed-point percentage)

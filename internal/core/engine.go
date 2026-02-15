@@ -31,6 +31,7 @@ type DeterministicCore struct {
 
 	persistChan    chan<- CoreOutput
 	projectionChan chan<- CoreOutput
+	publishChan    chan<- CoreOutput // Outbound events (LiquidationTriggered, ReduceOnly) for external consumers
 }
 
 type CoreOutput struct {
@@ -41,7 +42,7 @@ type CoreOutput struct {
 
 func NewDeterministicCore(
 	startSequence int64,
-	persistChan, projectionChan chan<- CoreOutput,
+	persistChan, projectionChan, publishChan chan<- CoreOutput,
 	dbChecker DBIdempotencyChecker,
 	metrics *observability.Metrics,
 ) *DeterministicCore {
@@ -73,6 +74,7 @@ func NewDeterministicCore(
 		metrics:           metrics,
 		persistChan:       persistChan,
 		projectionChan:    projectionChan,
+		publishChan:       publishChan,
 	}
 }
 
@@ -122,6 +124,11 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 		batch, dispatchErr := c.dispatchEvent(evt)
 		if dispatchErr != nil {
 			return fmt.Errorf("dispatch failed: %w", dispatchErr)
+		}
+		// nil batch signals "skip silently" (e.g., stale MarkPriceUpdate).
+		// No sequence consumption, no persistence, no projection.
+		if batch == nil {
+			return nil
 		}
 		batches = []*ledger.Batch{batch}
 	}
@@ -185,6 +192,18 @@ func (c *DeterministicCore) ProcessEvent(evt event.Event) error {
 					c.checkMarginForUser(pos.UserID, pos.MarketID, snapshot.Timestamp)
 				}
 			}
+		}
+	}
+
+	// Step 10a: Post-batch margin check for LiquidationFill
+	// Per flow liquidation-fill-processing-sequence: check if margin recovered
+	// after partial liquidation. Must run AFTER batch is applied so margin release
+	// is reflected in balances.
+	if liqFillEvt, ok := evt.(*event.LiquidationFill); ok {
+		quoteAssetID, _ := ledger.GetAssetID("USDT")
+		marginStatus := c.marginCalc.CheckMarginHealth(liqFillEvt.UserID, quoteAssetID)
+		if marginStatus == state.MarginStatusHealthy {
+			c.liquidationMgr.CheckMarginRecovery(liqFillEvt.LiquidationID, true)
 		}
 	}
 
@@ -680,7 +699,11 @@ func (c *DeterministicCore) emitReduceOnlyEvents(
 
 	if newState == state.LiquidationStateAtRisk && prevState == state.LiquidationStateHealthy {
 		evtType = event.EventTypeReduceOnlyModeEntered
-	} else if newState == state.LiquidationStateHealthy && prevState == state.LiquidationStateAtRisk {
+	} else if newState == state.LiquidationStateHealthy &&
+		(prevState == state.LiquidationStateAtRisk || prevState == state.LiquidationStatePartiallyLiquidated) {
+		// Per flow reduce-only-mode-enforcement-flowchart: ReduceOnlyModeExited
+		// must be published when user recovers to Healthy from ANY restricted state,
+		// including PartiallyLiquidated (margin recovered after partial liquidation).
 		evtType = event.EventTypeReduceOnlyModeExited
 	} else {
 		return
@@ -696,10 +719,19 @@ func (c *DeterministicCore) emitReduceOnlyEvents(
 		},
 	}
 
-	// Non-blocking send to projection channel only (informational event)
+	// Non-blocking send to projection channel (informational event)
 	select {
 	case c.projectionChan <- output:
 	default:
+	}
+
+	// Non-blocking send to publish channel — ReduceOnlyMode events inform
+	// the matching engine via outbound NATS (per flow reduce-only-mode-enforcement)
+	if c.publishChan != nil {
+		select {
+		case c.publishChan <- output:
+		default:
+		}
 	}
 }
 
@@ -707,7 +739,7 @@ func (c *DeterministicCore) emitReduceOnlyEvents(
 // Mark price updates do NOT generate journal entries — they only mutate in-memory
 // state (mark price cache) and may trigger liquidation side-effects.
 func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*ledger.Batch, error) {
-	err := c.positionManager.UpdateMarkPrice(
+	updated, err := c.positionManager.UpdateMarkPrice(
 		evt.Market,
 		evt.MarkPrice,
 		evt.PriceSequence,
@@ -716,6 +748,12 @@ func (c *DeterministicCore) handleMarkPriceUpdate(evt *event.MarkPriceUpdate) (*
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Per flow mark-price-update-sequence: stale updates are skipped entirely.
+	// No margin checks, no sequence consumption, no persistence.
+	if !updated {
+		return nil, nil
 	}
 
 	// Trigger margin checks for all positions in this market
@@ -849,6 +887,15 @@ func (c *DeterministicCore) triggerLiquidation(userID uuid.UUID, marketID string
 	case c.projectionChan <- output:
 	default:
 	}
+
+	// Non-blocking publish send — LiquidationTriggered must reach external
+	// liquidation engine via outbound NATS publisher (per flow event-publishing-outbound-sequence)
+	if c.publishChan != nil {
+		select {
+		case c.publishChan <- output:
+		default:
+		}
+	}
 }
 
 // handleLiquidationFill processes a liquidation fill from the liquidation engine.
@@ -908,11 +955,10 @@ func (c *DeterministicCore) handleLiquidationFill(evt *event.LiquidationFill) (*
 		return nil, err
 	}
 
-	// POST-FILL: Check if margin recovered after partial liquidation
-	marginStatus := c.marginCalc.CheckMarginHealth(evt.UserID, quoteAssetID)
-	if marginStatus == state.MarginStatusHealthy {
-		c.liquidationMgr.CheckMarginRecovery(evt.LiquidationID, true)
-	}
+	// NOTE: POST-FILL MARGIN CHECK is deferred to ProcessEvent after the batch
+	// is applied to balances. Running it here would use stale (pre-fill) balances
+	// because margin release hasn't been applied yet.
+	// See ProcessEvent Step 10 for LiquidationFill post-batch margin check.
 
 	return batch, nil
 }
@@ -1172,27 +1218,46 @@ func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*
 		Journals:  make([]ledger.Journal, 0),
 	}
 
-	// Adjust reserved margin for all positions in this market
+	// Adjust reserved margin for affected users.
+	// Per flow risk-param-update-flowchart: compute total required IM across ALL
+	// positions per user (not just this market), then compare against current reserved.
+	// This prevents cross-market collision where adjusting one market's position
+	// incorrectly releases margin needed by positions in other markets.
 	allPositions := c.positionManager.GetAllPositions()
+
+	// Collect unique users who have positions in the affected market
+	affectedUsers := make(map[uuid.UUID]bool)
 	for _, pos := range allPositions {
-		if pos.MarketID != evt.Market || pos.IsFlat() {
-			continue
+		if pos.MarketID == evt.Market && !pos.IsFlat() {
+			affectedUsers[pos.UserID] = true
+		}
+	}
+
+	for userID := range affectedUsers {
+		// Compute total required IM across ALL user positions (all markets)
+		var totalRequiredIM int64
+		userPositions := c.positionManager.GetUserPositions(userID)
+		for _, pos := range userPositions {
+			if pos.IsFlat() {
+				continue
+			}
+			params, ok := c.riskParamsMgr.GetRiskParams(pos.MarketID)
+			if !ok {
+				continue
+			}
+			notional, err := c.positionManager.ComputePositionNotional(pos)
+			if err != nil {
+				continue
+			}
+			totalRequiredIM += notional * params.IMFraction / 1_000_000
 		}
 
-		// Compute required IM under new params
-		notional, err := c.positionManager.ComputePositionNotional(pos)
-		if err != nil {
-			continue
-		}
-		requiredIM := notional * newParams.IMFraction / 1_000_000
+		currentReserved := c.balanceTracker.GetUserReservedBalance(userID, quoteAssetID)
 
-		// Current reserved balance for this user
-		currentReserved := c.balanceTracker.GetUserReservedBalance(pos.UserID, quoteAssetID)
-
-		if requiredIM > currentReserved {
+		if totalRequiredIM > currentReserved {
 			// Need to reserve more: collateral → reserved
-			delta := requiredIM - currentReserved
-			available := c.balanceTracker.GetUserAvailableBalance(pos.UserID, quoteAssetID)
+			delta := totalRequiredIM - currentReserved
+			available := c.balanceTracker.GetUserAvailableBalance(userID, quoteAssetID)
 			if delta > available {
 				delta = available // Reserve what's available; margin check below handles the rest
 			}
@@ -1202,24 +1267,24 @@ func (c *DeterministicCore) handleRiskParamUpdate(evt *event.RiskParamUpdate) (*
 					BatchID:       batchID,
 					EventRef:      evt.IdempotencyKey(),
 					Sequence:      c.sequence,
-					DebitAccount:  ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeReserved, quoteAssetID),
-					CreditAccount: ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeCollateral, quoteAssetID),
+					DebitAccount:  ledger.NewUserAccountKey(userID, ledger.SubTypeReserved, quoteAssetID),
+					CreditAccount: ledger.NewUserAccountKey(userID, ledger.SubTypeCollateral, quoteAssetID),
 					AssetID:       quoteAssetID,
 					Amount:        delta,
 					JournalType:   ledger.JournalTypeMarginReserve,
 					Timestamp:     evt.Timestamp,
 				})
 			}
-		} else if requiredIM < currentReserved {
+		} else if totalRequiredIM < currentReserved {
 			// Release excess: reserved → collateral
-			delta := currentReserved - requiredIM
+			delta := currentReserved - totalRequiredIM
 			batch.Journals = append(batch.Journals, ledger.Journal{
 				JournalID:     uuid.New(),
 				BatchID:       batchID,
 				EventRef:      evt.IdempotencyKey(),
 				Sequence:      c.sequence,
-				DebitAccount:  ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeCollateral, quoteAssetID),
-				CreditAccount: ledger.NewUserAccountKey(pos.UserID, ledger.SubTypeReserved, quoteAssetID),
+				DebitAccount:  ledger.NewUserAccountKey(userID, ledger.SubTypeCollateral, quoteAssetID),
+				CreditAccount: ledger.NewUserAccountKey(userID, ledger.SubTypeReserved, quoteAssetID),
 				AssetID:       quoteAssetID,
 				Amount:        delta,
 				JournalType:   ledger.JournalTypeMarginRelease,

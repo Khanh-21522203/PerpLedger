@@ -106,28 +106,38 @@ func (pw *PersistenceWorker) Run(ctx context.Context) error {
 
 // flushWithRetry attempts to flush with exponential backoff.
 // Per flow persistence-worker-batching-flowchart: on write failure, retry with
-// exponential backoff. Never drop events.
+// exponential backoff. Worker NEVER drops events — it retries indefinitely until
+// the write succeeds or the context is cancelled (graceful shutdown).
 func (pw *PersistenceWorker) flushWithRetry(ctx context.Context, events []EventRow, journals []JournalRow) error {
-	const maxRetries = 5
 	backoff := 100 * time.Millisecond
+	const maxBackoff = 30 * time.Second
 
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			log.Printf("WARN: persistence retry attempt %d/%d after %v", attempt, maxRetries, backoff)
+			log.Printf("WARN: persistence retry attempt %d (backoff=%v, events=%d)",
+				attempt, backoff, len(events))
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				// Graceful shutdown — attempt one final flush with background context
+				// to avoid losing the batch.
+				finalErr := pw.flush(context.Background(), events, journals)
+				if finalErr != nil {
+					return fmt.Errorf("final flush on shutdown failed: %w", finalErr)
+				}
+				return nil
 			case <-time.After(backoff):
 			}
 			backoff *= 2
-			if backoff > 10*time.Second {
-				backoff = 10 * time.Second
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 		}
 
-		lastErr = pw.flush(ctx, events, journals)
-		if lastErr == nil {
+		err := pw.flush(ctx, events, journals)
+		if err == nil {
+			if attempt > 0 {
+				log.Printf("INFO: persistence flush succeeded after %d retries", attempt)
+			}
 			return nil
 		}
 
@@ -135,8 +145,6 @@ func (pw *PersistenceWorker) flushWithRetry(ctx context.Context, events []EventR
 			pw.metrics.PersistErrors.WithLabelValues("retry").Inc()
 		}
 	}
-
-	return fmt.Errorf("flush failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func (pw *PersistenceWorker) flush(ctx context.Context, events []EventRow, journals []JournalRow) error {

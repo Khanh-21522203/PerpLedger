@@ -16,7 +16,8 @@ import (
 func newTestCore() (*core.DeterministicCore, chan core.CoreOutput, chan core.CoreOutput) {
 	persistChan := make(chan core.CoreOutput, 1024)
 	projChan := make(chan core.CoreOutput, 1024)
-	c := core.NewDeterministicCore(0, persistChan, projChan, nil, nil)
+	publishChan := make(chan core.CoreOutput, 1024)
+	c := core.NewDeterministicCore(0, persistChan, projChan, publishChan, nil, nil)
 	return c, persistChan, projChan
 }
 
@@ -692,7 +693,8 @@ func TestEnvelope_HasCorrectFields(t *testing.T) {
 func TestProjectionChannel_DropsOnFull(t *testing.T) {
 	persistCh := make(chan core.CoreOutput, 1024)
 	projCh := make(chan core.CoreOutput, 1) // Tiny buffer — will fill up
-	c := core.NewDeterministicCore(0, persistCh, projCh, nil, nil)
+	publishCh := make(chan core.CoreOutput, 1024)
+	c := core.NewDeterministicCore(0, persistCh, projCh, publishCh, nil, nil)
 
 	userID := uuid.New()
 

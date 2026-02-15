@@ -34,6 +34,7 @@ const (
 	SubTypeSystemPendingDeposits
 	SubTypeSystemPendingWithdrawals
 	SubTypeSystemSocializedLoss
+	SubTypeSystemPnLClearing
 
 	// External sub-types
 	SubTypeExternalDeposits
@@ -172,6 +173,14 @@ func parseSubType(name string) AccountSubType {
 		return SubTypeSystemFundingPool
 	case "insurance_fund":
 		return SubTypeSystemInsuranceFund
+	case "pending_deposits":
+		return SubTypeSystemPendingDeposits
+	case "pending_withdrawals":
+		return SubTypeSystemPendingWithdrawals
+	case "socialized_loss":
+		return SubTypeSystemSocializedLoss
+	case "pnl_clearing":
+		return SubTypeSystemPnLClearing
 	case "deposits":
 		return SubTypeExternalDeposits
 	case "withdrawals":
@@ -217,6 +226,14 @@ func (k AccountKey) subTypeName() string {
 		return "funding_pool"
 	case SubTypeSystemInsuranceFund:
 		return "insurance_fund"
+	case SubTypeSystemPendingDeposits:
+		return "pending_deposits"
+	case SubTypeSystemPendingWithdrawals:
+		return "pending_withdrawals"
+	case SubTypeSystemSocializedLoss:
+		return "socialized_loss"
+	case SubTypeSystemPnLClearing:
+		return "pnl_clearing"
 	case SubTypeExternalDeposits:
 		return "deposits"
 	case SubTypeExternalWithdrawals:
